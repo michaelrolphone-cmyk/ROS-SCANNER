@@ -1,886 +1,2414 @@
 #!/usr/bin/env python3
 """
-ros_ultra_ocr.py
-Ultra-quality OCR extractor for *scanned* Record of Survey / plat drawings (raster-only).
+ros_ultra_ocr.py — Ultra / Max-quality OCR for Record of Survey (scanned-image PDFs)
 
-Features:
-- Bearing + distance extraction from angled callouts (N/S .. E/W)
-- Decimal recovery when OCR drops the dot (pixel dot evidence + number-only re-read)
-- Linework-crossing suppression (line mask overlap + inpaint variants)
-- Line/Curve table harvesting (best-effort)
-- Basis of Bearing detection ("BASIS OF BEARING" + nearest pair)
-- Historic/record distance capture: (123.45) and REC/RECORD/OLD forms.
+Primary goal:
+  Extract bearings + measured distances (+ optional record distances in parentheses)
+  from noisy ROS scans, including:
+    - Callout text near linework (bearings/distances at arbitrary angles)
+    - Line tables / curve tables (L1/L2..., C1/C2...)
+    - Basis of Bearing (restore detection)
+    - Heavy multipass + multi-angle + multi-DPI voting (hours OK)
 
-Deps:
+This file is a full replacement that:
+  ✅ Fixes PaddleOCR v3.x crash: removes show_log, supports use_textline_orientation, and normalizes outputs
+  ✅ Keeps your max-quality rotation/ROI/multipass approach
+  ✅ Uses ThreadPoolExecutor for per-angle work (default 16 threads)
+  ✅ Avoids Tesseract shlex quote errors by ensuring configs contain NO quotes
+  ✅ Adds optional DocTR + optional PaddleOCR engines (used if installed; fails soft if not)
+  ✅ Retains pixel-dot decimal recovery (no digit-length guessing)
+  ✅ Retains linework mask + inpaint variants, overlap penalties, clutter filters
+  ✅ Restores Basis of Bearing detection (keyword-driven + voting)
+
+Install minimum:
   pip install pytesseract pdf2image Pillow opencv-python-headless numpy
 
-macOS:
-  brew install tesseract poppler
+Optional (recommended) engines:
+  pip install paddleocr
+  pip install python-doctr[torch]   # DocTR
 
-Usage (quality-first; can take a long time):
-  python ros_ultra_ocr.py file.pdf --dpis 450,650,900 --pages 1-3 --threads 12 --out out.json --annotate debug.png --verbose
+Usage (max quality, threaded):
+  python ros_ultra_ocr.py file.pdf --quality max --threads 16 --output out.json --verbose
+
+Disable optional engines:
+  python ros_ultra_ocr.py file.pdf --no-paddle --no-doctr
 """
 
-from __future__ import annotations
-import argparse, json, math, os, re, sys, warnings
-from dataclasses import dataclass
+import re
+import sys
+import os
+import json
+import argparse
+import warnings
 from pathlib import Path
-from collections import defaultdict, Counter
+from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Optional
 
-import numpy as np
-import cv2
-import pytesseract
-from pytesseract import Output
-from pdf2image import convert_from_path, pdfinfo_from_path
-from PIL import Image
+# ---------------------------
+# Core deps (required)
+# ---------------------------
+try:
+    import pytesseract
+    from pytesseract import Output
+    from pdf2image import convert_from_path, pdfinfo_from_path
+    from PIL import Image
+    import cv2
+    import numpy as np
+except ImportError as e:
+    print(f"Missing package: {e}")
+    print("Install: pip install pytesseract pdf2image Pillow opencv-python-headless numpy")
+    sys.exit(1)
 
-Image.MAX_IMAGE_PIXELS = 900_000_000
+# ---------------------------
+# Optional deps (best-effort)
+# ---------------------------
+_DOCTR_OK = False
+_PADDLE_OK = False
+
+try:
+    # DocTR (optional)
+    from doctr.models import ocr_predictor  # type: ignore
+    from doctr.io import DocumentFile       # type: ignore
+    _DOCTR_OK = True
+except Exception:
+    _DOCTR_OK = False
+
+try:
+    # PaddleOCR (optional)
+    from paddleocr import PaddleOCR         # type: ignore
+    _PADDLE_OK = True
+except Exception:
+    _PADDLE_OK = False
+
+# ---------------------------
+# PIL / large image safety
+# ---------------------------
+Image.MAX_IMAGE_PIXELS = 800_000_000
 warnings.simplefilter("ignore", Image.DecompressionBombWarning)
 
-# ----------------- parsing -----------------
+# Pixel budget controls (keep you from OOM when DPI is huge)
+MAX_DET_PIXELS = 12_000_000         # low-res detection stage budget
+MAX_ROI_PIXELS = 18_000_000         # per ROI crop budget (tiling splits if larger)
+MAX_VARIANT_PIXELS = 18_000_000     # per preprocess variant scaling cap
 
-DIGIT_FIX = str.maketrans({"O":"0","o":"0","D":"0","I":"1","l":"1","|":"1","S":"5","s":"5","B":"8","Z":"2"})
-BEARING_RE = re.compile(r"(?P<ns>[NS])\s*(?P<deg>[0-9OolIDSBZ|]{1,3})\s*(?:[°oº]\s*)?(?P<min>[0-9OolIDSBZ|]{1,2})\s*(?:[\'’]\s*)?(?P<sec>[0-9OolIDSBZ|]{1,2})?\s*(?:[”″])?\s*(?P<ew>[EW])", re.I)
-PAREN_RE = re.compile(r"\(([^)]+)\)")
-REC_RE = re.compile(r"(?i)\b(?:REC|RECORD|OLD)\s*=?\s*([0-9OolIDSBZ|][0-9OolIDSBZ|,]*([.·•∙⋅][0-9OolIDSBZ|]{1,4})?)")
+# ---------------------------
+# Linework filtering controls
+# ---------------------------
+LINE_OVERLAP_HARD_REJECT = 0.60   # if line mask covers >60% of token bbox, skip candidate
+LINE_OVERLAP_PENALTY_WT  = 3.0    # score penalty weight during voting
+LINE_INPAINT_RADII       = [2, 3, 4]  # try multiple line-inpaint radii in max mode
+
+# ---------------------------
+# Metadata / clutter filters
+# ---------------------------
+HEADER_FOOTER_STRIP_FRAC = 0.08   # ignore candidates in top/bottom 8% during full-page tiling
+METADATA_KEYWORDS = {
+    "recorded", "filed", "re-recorded", "rerecorded", "instrument", "instr", "doc", "document",
+    "book", "page", "index", "ros", "r.o.s", "survey", "county", "auditor", "assessor",
+    "tax", "parcel", "apn", "pin", "project", "sheet", "scale", "date", "dated"
+}
+MONTHS = {
+    "january", "february", "march", "april", "may", "june", "july", "august", "september",
+    "october", "november", "december", "jan", "feb", "mar", "apr", "jun", "jul", "aug",
+    "sep", "sept", "oct", "nov", "dec"
+}
+
+AREA_UNITS_RE = re.compile(
+    r"(?i)\b(a\.?\s*c\.?|acres?|acre|sq\.?\s*ft|sqft|s\.?\s*f\.?|sf|square\s+feet)\b"
+)
+YEAR_RE = re.compile(r"\b(19|20)\d{2}\b")
+DATE_RE = re.compile(r"\b\d{1,2}[/-]\d{1,2}[/-](?:\d{2}|\d{4})\b")
+
+# ---------------------------
+# OCR cleanup maps / regex
+# ---------------------------
+DIGIT_FIX = str.maketrans({
+    "O": "0", "o": "0", "D": "0",
+    "I": "1", "l": "1", "|": "1",
+    "S": "5", "s": "5",
+    "B": "8",
+    "Z": "2",
+})
+
+BEARING_RE = re.compile(
+    r"""
+    (?P<ns>[NS])\s*
+    (?P<deg>[0-9OolIDSBZ|]{1,3})\s*
+    (?:[°oº]\s*)?
+    (?P<min>[0-9OolIDSBZ|]{1,2})\s*
+    (?:[\'’]\s*)?
+    (?P<sec>[0-9OolIDSBZ|]{1,2})?
+    \s*(?:["”])?
+    \s*(?P<ew>[EW])
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+DIST_TOKEN_RE = re.compile(r"^\(?\d[\d,]*([.·•∙⋅]\d{1,4})?\)?$")
+
+# Heuristic for ROI discovery (line-level)
+CANDIDATE_LINE_RE = re.compile(
+    r"(?i)\b[NS]\s*\d{1,3}\s*(?:[°oº]|\s)\s*\d{1,2}.*\b[EW]\b.*\d{2,10}"
+)
+
+# Table labels
 LINE_ID_RE = re.compile(r"(?i)\bL[\s\-]?\d{1,3}\b")
 CURVE_ID_RE = re.compile(r"(?i)\bC[\s\-]?\d{1,3}\b")
-BASIS_RE = re.compile(r"(?i)\bbasis\s+of\s+bearing(s)?\b")
+CURVE_HINT_RE = re.compile(r"(?i)\b(chord|delta|radius|length|arc|tangent)\b")
 
-def norm(s: str) -> str:
-    return re.sub(r"\s+"," ",(s or "").strip())
+# Basis of bearing cues
+BASIS_CUE_RE = re.compile(r"(?i)\b(basis\s+of\s+bearing|basis\s+of\s+bearings|b\.?o\.?b\.?)\b")
 
-def canon_label(tok: str) -> Optional[str]:
-    if not tok: return None
-    t = tok.strip().upper().replace(" ","").replace("-","")
-    return t if re.fullmatch(r"[LC]\d{1,3}", t) else None
+def _clean_digits(s: str) -> str:
+    return (s or "").translate(DIGIT_FIX)
 
-def parse_bearing(text: str) -> Optional[str]:
-    m = BEARING_RE.search(text or "")
-    if not m: return None
-    ns, ew = m.group("ns").upper(), m.group("ew").upper()
-    deg_s = (m.group("deg") or "").translate(DIGIT_FIX)
-    min_s = (m.group("min") or "").translate(DIGIT_FIX)
-    sec_s = (m.group("sec") or "0").translate(DIGIT_FIX)
+def canon_label(s: str) -> str | None:
+    if not s:
+        return None
+    t = s.strip().upper().replace(" ", "").replace("-", "")
+    if re.fullmatch(r"[LC]\d{1,3}", t):
+        return t
+    return None
+
+# ---------------------------
+# Bearing parsing
+# ---------------------------
+def parse_bearing_to_canon(bearing_text: str) -> str | None:
+    m = BEARING_RE.search(bearing_text or "")
+    if not m:
+        return None
+
+    ns = m.group("ns").upper()
+    ew = m.group("ew").upper()
+
+    deg_s = _clean_digits(m.group("deg"))
+    min_s = _clean_digits(m.group("min"))
+    sec_s = _clean_digits(m.group("sec") or "0")
+
     try:
-        deg, minute, sec = int(deg_s), int(min_s), int(sec_s)
+        deg = int(deg_s)
+        minute = int(min_s)
+        sec = int(sec_s)
     except ValueError:
         return None
+
+    # common OCR: degree sometimes 100+ or 200+ or 300+ from garbage prefix
     if deg > 90:
-        for k in (300,200,100):
-            if k <= deg < k+90:
-                deg -= k; break
-    if 60 <= minute <= 99: minute -= 60
-    if 60 <= sec <= 99: sec -= 60
-    if not (0<=deg<=90 and 0<=minute<=59 and 0<=sec<=59): return None
+        if 100 <= deg < 190:
+            deg -= 100
+        elif 200 <= deg < 290:
+            deg -= 200
+        elif 300 <= deg < 390:
+            deg -= 300
+
+    # common OCR: minute/sec sometimes offset by 60
+    if 60 <= minute <= 99:
+        minute -= 60
+    if 60 <= sec <= 99:
+        sec -= 60
+
+    if not (0 <= deg <= 90 and 0 <= minute <= 59 and 0 <= sec <= 59):
+        return None
+
     return f"{ns} {deg:02d}°{minute:02d}'{sec:02d}\" {ew}"
 
-def bearing_theta(canon: str) -> Optional[float]:
-    m = re.match(r"^([NS])\s+(\d{2})°(\d{2})'(\d{2})\"\s+([EW])$", canon or "")
-    if not m: return None
+def bearing_theta_deg(canon_bearing: str) -> float | None:
+    m = re.match(r"^([NS])\s+(\d{2})°(\d{2})'(\d{2})\"\s+([EW])$", canon_bearing)
+    if not m:
+        return None
     ns, d, mi, se, ew = m.group(1), int(m.group(2)), int(m.group(3)), int(m.group(4)), m.group(5)
-    ang = d + mi/60.0 + se/3600.0
-    if ns=="N" and ew=="E": return ang
-    if ns=="N" and ew=="W": return (360-ang)%360
-    if ns=="S" and ew=="E": return (180-ang)%360
-    if ns=="S" and ew=="W": return (180+ang)%360
+    ang = d + mi / 60.0 + se / 3600.0
+    if ns == "N" and ew == "E":
+        return ang
+    if ns == "N" and ew == "W":
+        return (360.0 - ang) % 360.0
+    if ns == "S" and ew == "E":
+        return (180.0 - ang) % 360.0
+    if ns == "S" and ew == "W":
+        return (180.0 + ang) % 360.0
     return None
 
-def record_distance(line: str) -> Optional[str]:
-    t = line or ""
-    m = PAREN_RE.search(t)
-    if m:
-        inside = re.sub(r"[^0-9.,·•∙⋅]","", m.group(1) or "")
-        inside = inside.replace("·",".").replace("•",".").replace("∙",".").replace("⋅",".").replace(",","").translate(DIGIT_FIX)
-        if inside and re.search(r"\d", inside):
-            try:
-                v = float(inside)
-                return str(int(round(v))) if abs(v-round(v)) < 1e-9 else f"{v:.3f}".rstrip("0").rstrip(".")
-            except ValueError:
-                pass
-    m = REC_RE.search(t)
-    if m:
-        s=(m.group(1) or "").replace(",","").replace("·",".").replace("•",".").replace("∙",".").replace("⋅",".").translate(DIGIT_FIX)
-        s=re.sub(r"[^0-9.]", "", s)
-        if s:
-            try:
-                v=float(s)
-                return str(int(round(v))) if abs(v-round(v)) < 1e-9 else f"{v:.3f}".rstrip("0").rstrip(".")
-            except ValueError:
-                pass
-    return None
-
-def find_ref_id(line: str) -> Optional[str]:
-    m = LINE_ID_RE.search(line or "") or CURVE_ID_RE.search(line or "")
-    return canon_label(m.group(0)) if m else None
-
-CURVE_RADIUS_RE = re.compile(r"(?i)\b(?:R|RAD|RADIUS)\s*=?\s*([0-9OolIDSBZ|][0-9OolIDSBZ|,]*([.·•∙⋅][0-9OolIDSBZ|]{1,4})?)")
-CURVE_ARC_RE    = re.compile(r"(?i)\b(?:ARC\s*L(?:EN(?:GTH)?)?|ARCLEN|ARCLENGTH|AL|L\s*=)\s*=?\s*([0-9OolIDSBZ|][0-9OolIDSBZ|,]*([.·•∙⋅][0-9OolIDSBZ|]{1,4})?)")
-CURVE_CH_RE     = re.compile(r"(?i)\b(?:CH(?:ORD)?\s*L(?:EN(?:GTH)?)?|CHL|CL)\s*=?\s*([0-9OolIDSBZ|][0-9OolIDSBZ|,]*([.·•∙⋅][0-9OolIDSBZ|]{1,4})?)")
-CURVE_T_RE      = re.compile(r"(?i)\b(?:TAN(?:GENT)?|T)\s*=?\s*([0-9OolIDSBZ|][0-9OolIDSBZ|,]*([.·•∙⋅][0-9OolIDSBZ|]{1,4})?)")
-CURVE_DELTA_RE  = re.compile(r"(?i)\b(?:DELTA|Δ)\s*=?\s*([0-9OolIDSBZ|]{1,3})\s*(?:[°oº]\s*)?([0-9OolIDSBZ|]{1,2})?\s*(?:[\'’]\s*)?([0-9OolIDSBZ|]{1,2})?\s*(?:[”″])?")
-
-def _num_from(m: re.Match) -> Optional[float]:
-    s=(m.group(1) or "").replace(",","").replace("·",".").replace("•",".").replace("∙",".").replace("⋅",".").translate(DIGIT_FIX)
-    s=re.sub(r"[^0-9.]", "", s)
-    if not s: return None
-    try: return float(s)
-    except ValueError: return None
-
-def extract_curve_fields(text: str) -> Optional[dict]:
-    t = text or ""
-    out={}
-    m=CURVE_RADIUS_RE.search(t)
-    if m:
-        v=_num_from(m)
-        if v is not None: out["radius"]=v
-    m=CURVE_ARC_RE.search(t)
-    if m:
-        v=_num_from(m)
-        if v is not None: out["arc_length"]=v
-    m=CURVE_CH_RE.search(t)
-    if m:
-        v=_num_from(m)
-        if v is not None: out["chord_length"]=v
-    m=CURVE_T_RE.search(t)
-    if m:
-        v=_num_from(m)
-        if v is not None: out["tangent"]=v
-    m=CURVE_DELTA_RE.search(t)
-    if m:
-        deg=(m.group(1) or "").translate(DIGIT_FIX); mi=(m.group(2) or "0").translate(DIGIT_FIX); se=(m.group(3) or "0").translate(DIGIT_FIX)
-        try:
-            d=int(deg); m2=int(mi); s2=int(se)
-            if d>360:
-                for k in (300,200,100):
-                    if k <= d < k+360: d-=k; break
-            if 60<=m2<=99: m2-=60
-            if 60<=s2<=99: s2-=60
-            if 0<=d<=360 and 0<=m2<=59 and 0<=s2<=59:
-                out["delta"]=f"{d:02d}°{m2:02d}'{s2:02d}\""
-        except ValueError:
-            pass
-    cb = parse_bearing(t)
-    if cb and (("CH" in t.upper()) or ("CB" in t.upper()) or ("CHORD" in t.upper())):
-        out["chord_bearing"]=cb
-    return out or None
-
-# ----------------- imaging -----------------
-
-def to_gray(pil: Image.Image) -> np.ndarray:
-    return cv2.cvtColor(np.array(pil.convert("RGB")), cv2.COLOR_RGB2GRAY)
-
-def downscale(pil: Image.Image, max_pixels: int) -> tuple[Image.Image, float]:
-    W,H = pil.size
-    pix = W*H
-    if pix <= max_pixels: return pil, 1.0
-    s = math.sqrt(max_pixels/float(pix))
-    return pil.resize((max(1,int(W*s)), max(1,int(H*s))), Image.BICUBIC), s
-
-def rotate_keep(pil: Image.Image, ang: float) -> Image.Image:
-    a = float(ang)%360.0
-    if abs(a) < 1e-9: return pil
-    arr = np.array(pil.convert("RGB"))
-    h,w = arr.shape[:2]
-    M = cv2.getRotationMatrix2D((w/2.0, h/2.0), a, 1.0)
-    out = cv2.warpAffine(arr, M, (w,h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_CONSTANT, borderValue=(255,255,255))
-    return Image.fromarray(out)
-
-def inv_rotate_point(x: float, y: float, W: int, H: int, ang_deg: float) -> tuple[float,float]:
-    a = math.radians(float(ang_deg)%360.0)
-    cx, cy = W/2.0, H/2.0
-    xr, yr = x-cx, y-cy
-    ca, sa = math.cos(-a), math.sin(-a)
-    xo = xr*ca - yr*sa + cx
-    yo = xr*sa + yr*ca + cy
-    return xo, yo
-
-def quad_to_bbox_original(quad: np.ndarray, W: int, H: int, ang_deg: float) -> tuple[int,int,int,int]:
-    pts = [inv_rotate_point(float(p[0]), float(p[1]), W, H, ang_deg) for p in quad]
-    xs = [p[0] for p in pts]; ys = [p[1] for p in pts]
-    x1,y1,x2,y2 = int(max(0,min(xs))), int(max(0,min(ys))), int(min(W,max(xs))), int(min(H,max(ys)))
-    return (x1,y1,x2,y2)
-
-def order_quad(pts: np.ndarray) -> np.ndarray:
-    s = pts.sum(axis=1); d = np.diff(pts,axis=1).reshape(-1)
-    tl = pts[np.argmin(s)]; br = pts[np.argmax(s)]
-    tr = pts[np.argmin(d)]; bl = pts[np.argmax(d)]
-    return np.array([tl,tr,br,bl], dtype=np.float32)
-
-def warp_quad(pil: Image.Image, quad: np.ndarray, pad: int=6) -> Image.Image:
-    q = order_quad(quad.astype(np.float32))
-    wA = np.linalg.norm(q[2]-q[3]); wB = np.linalg.norm(q[1]-q[0])
-    hA = np.linalg.norm(q[1]-q[2]); hB = np.linalg.norm(q[0]-q[3])
-    Wt = int(max(wA,wB))+2*pad; Ht = int(max(hA,hB))+2*pad
-    Wt = max(16, min(Wt, 5000)); Ht = max(16, min(Ht, 2400))
-    dst = np.array([[pad,pad],[Wt-pad,pad],[Wt-pad,Ht-pad],[pad,Ht-pad]], dtype=np.float32)
-    M = cv2.getPerspectiveTransform(q, dst)
-    arr = np.array(pil.convert("RGB"))
-    out = cv2.warpPerspective(arr, M, (Wt,Ht), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_CONSTANT, borderValue=(255,255,255))
-    return Image.fromarray(out)
-
-def adaptive_inv(gray: np.ndarray) -> np.ndarray:
-    return cv2.adaptiveThreshold(gray,255,cv2.ADAPTIVE_THRESH_GAUSSIAN_C,cv2.THRESH_BINARY_INV,31,10)
-
-def build_line_mask(gray: np.ndarray) -> np.ndarray:
-    h,w = gray.shape[:2]
-    bw = adaptive_inv(gray)
-    hk = max(25, w//18); vk = max(25, h//18)
-    horiz = cv2.morphologyEx(bw, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT,(hk,1)), iterations=1)
-    vert  = cv2.morphologyEx(bw, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT,(1,vk)), iterations=1)
-    mask = cv2.bitwise_or(horiz, vert)
-    mask = cv2.dilate(mask, np.ones((3,3),np.uint8), iterations=1)
-    return mask
-
-def overlap(mask: np.ndarray, bb: tuple[int,int,int,int]) -> float:
-    x1,y1,x2,y2 = bb
-    x1=max(0,x1); y1=max(0,y1); x2=min(mask.shape[1],x2); y2=min(mask.shape[0],y2)
-    if x2<=x1 or y2<=y1: return 0.0
-    roi = mask[y1:y2,x1:x2]
-    return float(np.count_nonzero(roi))/float(roi.size)
-
-def inpaint(gray: np.ndarray, radius: int=3) -> tuple[np.ndarray,np.ndarray]:
-    m = build_line_mask(gray)
-    return cv2.inpaint(gray, m, inpaintRadius=int(radius), flags=cv2.INPAINT_TELEA), m
-
-# ----------------- dot evidence + number reread -----------------
-
-def dot_digits_right(dot_ref_gray: np.ndarray, bb: tuple[int,int,int,int]) -> Optional[int]:
-    x1,y1,x2,y2 = bb
-    w=max(1,x2-x1); h=max(1,y2-y1)
-    mx=max(2,int(w*0.08)); my=max(2,int(h*0.12))
-    X1=max(0,x1-mx); Y1=max(0,y1-my); X2=min(dot_ref_gray.shape[1],x2+mx); Y2=min(dot_ref_gray.shape[0],y2+my)
-    crop = dot_ref_gray[Y1:Y2,X1:X2]
-    if crop.size==0: return None
-    _, bw = cv2.threshold(crop,0,255,cv2.THRESH_BINARY_INV|cv2.THRESH_OTSU)
-    n,_,stats,cent = cv2.connectedComponentsWithStats(bw,8)
-    if n<=2: return None
-    comps=[]
-    for i in range(1,n):
-        x,y,cw,ch,area = stats[i]
-        if area<2: continue
-        cx,cy = cent[i]
-        comps.append((cw,ch,area,cx,cy))
-    if not comps: return None
-    areas=sorted([c[2] for c in comps], reverse=True)[:6]
-    med = float(np.median(areas)) if areas else 0.0
-    if med<=0: return None
-    digits=[c for c in comps if c[2] >= max(6,0.10*med)]
-    if len(digits)<2: return None
-    cy_med = float(np.median([c[4] for c in digits]))
-    dots=[]
-    for (cw,ch,area,cx,cy) in comps:
-        if area >= 0.35*med or area < 2: continue
-        if cw>0.40*w or ch>0.40*h: continue
-        fill = area/max(1.0,float(cw*ch))
-        if fill<0.20: continue
-        if not (cy>=0.50*h and cy<=0.95*h): continue
-        if cy < cy_med: continue
-        ar = cw/max(1.0,float(ch)); ar = ar if ar>=1 else 1/ar
-        if ar>3.0: continue
-        score = (1.0-min(1.0,area/(0.35*med)))*2.0 + (1.0-min(1.0,(ar-1.0)/2.0))*1.5 + fill
-        dots.append((score,cx))
-    if not dots: return None
-    dots.sort(reverse=True)
-    dot_cx = dots[0][1]
-    dx = sorted([c[3] for c in digits])
-    right=[x for x in dx if x>dot_cx+1.5]; left=[x for x in dx if x<dot_cx-1.5]
-    if len(left)<1 or len(right)<1 or len(right)>4: return None
-    return len(right)
-
-def parse_dist(raw: str, dot_r: Optional[int], min_ft: float=0.0, max_ft: float=50_000_000.0) -> tuple[Optional[float], str]:
-    s=(raw or "").strip().replace(" ","")
-    s=s.replace("·",".").replace("•",".").replace("∙",".").replace("⋅",".")
-    if "(" in s: s=s.split("(",1)[0]
-    s=s.replace(",","").translate(DIGIT_FIX)
-    if not s or not re.search(r"\d", s): return None,"invalid"
-    if "." in s:
-        try:
-            v=float(s)
-            return (v,"explicit_decimal") if min_ft<=v<=max_ft else (None,"invalid")
-        except ValueError:
-            pass
-    digits=re.sub(r"\D","",s)
-    if not digits: return None,"invalid"
-    if dot_r is not None and 1<=dot_r<len(digits):
-        ins=len(digits)-dot_r
-        try:
-            v=float(digits[:ins]+"."+digits[ins:])
-            if min_ft<=v<=max_ft: return v,"dot_blob"
-        except ValueError:
-            pass
-    try:
-        v=float(digits)
-        return (v,"integer") if min_ft<=v<=max_ft else (None,"invalid")
-    except ValueError:
-        return None,"invalid"
-
-def number_reread(pil: Image.Image, timeout: Optional[int]) -> str:
-    img=pil
-    W,H=img.size
-    if W*H>2_000_000:
-        s=math.sqrt(2_000_000/(W*H)); img=img.resize((max(1,int(W*s)),max(1,int(H*s))), Image.BICUBIC)
-    if max(W,H)<160: img=img.resize((int(img.size[0]*2.5), int(img.size[1]*2.5)), Image.BICUBIC)
-    g=to_gray(img)
-    outs=[]
-    for inv in (False, True):
-        mode=(cv2.THRESH_BINARY_INV if inv else cv2.THRESH_BINARY)|cv2.THRESH_OTSU
-        _,bw=cv2.threshold(g,0,255,mode)
-        pilb=Image.fromarray(bw)
-        cfg="--oem 3 --psm 8 -c preserve_interword_spaces=1 -c tessedit_char_whitelist=0123456789."
-        try:
-            d=pytesseract.image_to_data(pilb,config=cfg,lang="eng",output_type=Output.DICT,timeout=timeout)
-        except TypeError:
-            d=pytesseract.image_to_data(pilb,config=cfg,lang="eng",output_type=Output.DICT)
-        txt="".join((t or "") for t in d.get("text",[]) if t and re.search(r"\d",t))
-        confs=[]
-        for c in d.get("conf",[]):
-            try:
-                c=float(c)
-                if c>=0: confs.append(c)
-            except Exception:
-                pass
-        outs.append((norm(txt), (sum(confs)/len(confs)) if confs else -1.0))
-    outs.sort(key=lambda x:x[1], reverse=True)
-    return outs[0][0] if outs else ""
-
-# ----------------- OCR line extraction -----------------
-
-def curve_params_from_line(line: dict) -> Optional[dict]:
-    txt = norm(line.get("text",""))
-    rid = find_ref_id(txt)
-    if not rid or not rid.startswith("C"):
-        return None
-    curve = extract_curve_fields(txt)
-    if not curve:
-        return None
-    return {"ref_id": rid, "curve": curve, "conf": float(line.get("conf",-1.0)), "text": txt, "line_box": line.get("bbox")}
-
-def ocr_lines(pil: Image.Image, cfg: str, timeout: Optional[int]) -> list[dict]:
-    try:
-        d=pytesseract.image_to_data(pil,config=cfg,lang="eng",output_type=Output.DICT,timeout=timeout)
-    except TypeError:
-        d=pytesseract.image_to_data(pil,config=cfg,lang="eng",output_type=Output.DICT)
-    n=len(d.get("text",[]))
-    lines={}
-    for i in range(n):
-        t=(d["text"][i] or "").strip()
-        if not t: continue
-        try: conf=float(d.get("conf",["-1"])[i])
-        except Exception: conf=-1.0
-        key=(int(d.get("block_num",[0])[i]), int(d.get("par_num",[0])[i]), int(d.get("line_num",[0])[i]))
-        x,y,w,h = int(d["left"][i]), int(d["top"][i]), int(d["width"][i]), int(d["height"][i])
-        bb=(x,y,x+w,y+h)
-        rec=lines.setdefault(key, {"words":[], "bbox":[x,y,x+w,y+h], "confs":[]})
-        rec["words"].append({"text":t,"conf":conf,"bbox":bb})
-        B=rec["bbox"]; B[0]=min(B[0],x); B[1]=min(B[1],y); B[2]=max(B[2],x+w); B[3]=max(B[3],y+h)
-        if conf>=0: rec["confs"].append(conf)
-    out=[]
-    for rec in lines.values():
-        rec["words"].sort(key=lambda w:w["bbox"][0])
-        text=" ".join(w["text"] for w in rec["words"])
-        conf=(sum(rec["confs"])/len(rec["confs"])) if rec["confs"] else -1.0
-        out.append({"text":text, "conf":conf, "bbox":tuple(rec["bbox"]), "words":rec["words"]})
-    out.sort(key=lambda r:(r["bbox"][1],r["bbox"][0]))
-    return out
-
-def preprocess_variants(crop: Image.Image, do_lineclean: bool) -> list[dict]:
-    base=crop
-    W,H=base.size
-    if W*H>18_000_000:
-        s=math.sqrt(18_000_000/(W*H)); base=base.resize((max(1,int(W*s)),max(1,int(H*s))), Image.BICUBIC)
-    g=to_gray(base)
-    g2=cv2.resize(g,None,fx=2.0,fy=2.0,interpolation=cv2.INTER_CUBIC)
-    cla=cv2.createCLAHE(clipLimit=2.2,tileGridSize=(8,8)).apply(g2)
-    lm = build_line_mask(g2)
-    lmc=build_line_mask(cla)
-    out=[{"name":"gray2x","pil":Image.fromarray(g2),"dot":g2,"mask":lm},
-         {"name":"clahe2x","pil":Image.fromarray(cla),"dot":cla,"mask":lmc}]
-    if do_lineclean:
-        clean,_=inpaint(g2, radius=3)
-        out.append({"name":"inpaint2x","pil":Image.fromarray(clean),"dot":clean,"mask":lm})
-    _,bw=cv2.threshold(cv2.GaussianBlur(cla,(3,3),0),0,255,cv2.THRESH_BINARY|cv2.THRESH_OTSU)
-    out.append({"name":"otsu_clahe2x","pil":Image.fromarray(bw),"dot":None,"mask":lmc})
-    return out
-
-def extract_pairs_from_line(line: dict, dot_ref: Optional[np.ndarray], line_mask: Optional[np.ndarray], num_timeout: Optional[int]) -> list[dict]:
-    txt=norm(line["text"])
-    if not txt or len(txt)<4: return []
-    bm=BEARING_RE.search(txt)
-    if not bm: return []
-    bcanon=parse_bearing(bm.group(0))
-    if not bcanon: return []
-    theta=bearing_theta(bcanon)
-    rec=record_distance(txt)
-    ref=find_ref_id(txt)
-    curve=extract_curve_fields(txt)
-
-    d_cands=[]
-    words=line.get("words") or []
-    b_end=-1
-    joined=[w["text"] for w in words]
-    for i in range(len(joined)):
-        for win in (3,4,5,6):
-            j=min(len(joined), i+win)
-            if BEARING_RE.search(" ".join(joined[i:j])):
-                b_end=j; break
-        if b_end!=-1: break
-    if b_end!=-1:
-        for k in range(b_end, min(len(words), b_end+14)):
-            t=(words[k]["text"] or "").strip()
-            if not t or re.search(r"[A-Za-z]",t) or not re.search(r"\d",t): continue
-            d_cands.append((t, words[k]["bbox"]))
-    if not d_cands:
-        tail=txt[bm.end():]
-        m=re.search(r"\d[\d,]*([.·•∙⋅]\d{1,4})?", tail)
-        if m: d_cands=[(m.group(0), None)]
-
-    out=[]
-    for raw, bb in d_cands[:5]:
-        ov=overlap(line_mask, bb) if (line_mask is not None and bb is not None) else 0.0
-        if ov>=0.65: continue
-        dot_r = dot_digits_right(dot_ref, bb) if (dot_ref is not None and bb is not None) else None
-        dv,q = parse_dist(raw, dot_r)
-        if (dv is None or q in ("integer","invalid")) and (bb is not None) and (dot_ref is not None):
-            x1,y1,x2,y2=bb; pad=max(3,int(0.25*(y2-y1)))
-            x1=max(0,x1-pad); y1=max(0,y1-pad); x2=min(dot_ref.shape[1],x2+pad); y2=min(dot_ref.shape[0],y2+pad)
-            rr=number_reread(Image.fromarray(dot_ref[y1:y2,x1:x2]), timeout=num_timeout).replace("..",".").translate(DIGIT_FIX)
-            rr=re.sub(r"[^0-9.]", "", rr)
-            if rr:
-                dv2,q2 = parse_dist(rr, None)
-                if dv2 is not None and (dv is None or (q in ("integer","invalid") and q2=="explicit_decimal")):
-                    dv,q,raw = dv2,q2,rr
-        if dv is None: continue
-        dist_str=f"{dv:.3f}".rstrip("0").rstrip(".") if q=="dot_blob" else f"{dv:.2f}".rstrip("0").rstrip(".")
-        out.append({"bearing":bcanon,"theta":theta,"distance":dist_str,"numeric_dist":float(dv),
-                    "dist_quality":q,"dist_raw":raw,"record_distance":rec,"ref_id":ref,"curve":curve,
-                    "conf":float(line.get("conf",-1.0)),"line_overlap":float(ov),"line_box":line["bbox"]})
-        break
-    return out
-
-# ----------------- text detection (CV) -----------------
-
-def detect_text_quads(page: Image.Image) -> list[np.ndarray]:
-    small, sc = downscale(page, max_pixels=12_000_000)
-    g=to_gray(small)
-    g=cv2.GaussianBlur(g,(3,3),0)
-    ink=adaptive_inv(g)
-    lm=build_line_mask(g)
-    text=cv2.bitwise_and(ink, cv2.bitwise_not(lm))
-    text=cv2.morphologyEx(text, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT,(3,3)), iterations=2)
-    text=cv2.dilate(text, cv2.getStructuringElement(cv2.MORPH_RECT,(3,3)), iterations=2)
-    text=cv2.medianBlur(text,3)
-    cnts,_=cv2.findContours(text, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    quads=[]
-    Hs,Ws=text.shape[:2]
-    for c in cnts:
-        area=cv2.contourArea(c)
-        if area<120: continue
-        rect=cv2.minAreaRect(c)
-        (cx,cy),(rw,rh),ang=rect
-        if rw<18 or rh<10: continue
-        if rw*rh > 0.25*(Ws*Hs): continue
-        rect2=((cx,cy),(rw*1.10,rh*1.18),ang)
-        box=cv2.boxPoints(rect2).astype(np.float32)
-        if sc!=1.0: box/=sc
-        quads.append(box)
-    def qarea(q):
-        xs=q[:,0]; ys=q[:,1]
-        return float((xs.max()-xs.min())*(ys.max()-ys.min()))
-    quads.sort(key=qarea)
-    return quads[:1400]
-
-# ----------------- table detection / parse (best-effort) -----------------
-
-def detect_table_rects(page: Image.Image) -> list[tuple[int,int,int,int]]:
-    small, sc = downscale(page, max_pixels=12_000_000)
-    g=to_gray(small); g=cv2.GaussianBlur(g,(3,3),0)
-    bw=adaptive_inv(g)
-    h,w=bw.shape[:2]
-    hk=max(35,w//12); vk=max(35,h//12)
-    horiz=cv2.morphologyEx(bw, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT,(hk,1)), iterations=1)
-    vert =cv2.morphologyEx(bw, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT,(1,vk)), iterations=1)
-    grid=cv2.dilate(cv2.bitwise_or(horiz,vert), np.ones((3,3),np.uint8), iterations=2)
-    cnts,_=cv2.findContours(grid, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    rects=[]
-    for c in cnts:
-        x,y,ww,hh=cv2.boundingRect(c); area=ww*hh
-        if area<8000: continue
-        if ww<0.12*w or hh<0.08*h: continue
-        if area>0.55*w*h: continue
-        pad_x=int(0.03*w); pad_y=int(0.03*h)
-        x1=max(0,x-pad_x); y1=max(0,y-pad_y); x2=min(w,x+ww+pad_x); y2=min(h,y+hh+pad_y)
-        if sc!=1.0:
-            x1=int(x1/sc); y1=int(y1/sc); x2=int(x2/sc); y2=int(y2/sc)
-        rects.append((x1,y1,x2,y2))
-    rects.sort(key=lambda r:(r[2]-r[0])*(r[3]-r[1]), reverse=True)
-    return rects[:10]
-
-def parse_table_roi(roi: Image.Image, do_lineclean: bool, tess_timeout: Optional[int], num_timeout: Optional[int]) -> tuple[list[dict], list[dict]]:
-    out=[]; curvep=[]
-    vars=preprocess_variants(roi, do_lineclean=do_lineclean)
-    cfg="--oem 3 --psm 6 -c preserve_interword_spaces=1 -c tessedit_enable_dict_correction=0 -c load_system_dawg=0 -c load_freq_dawg=0 -c tessedit_char_whitelist=0123456789NSEWnsewLC.,-°oº()' "
-    for v in vars:
-        lines=ocr_lines(v["pil"], cfg, timeout=tess_timeout)
-        for ln in lines:
-            t=norm(ln["text"])
-            if not t: continue
-            rid=find_ref_id(t)
-            if not rid: continue
-            if rid.startswith('C'):
-                c=extract_curve_fields(t)
-                if c:
-                    curvep.append({"ref_id":rid,"curve":c,"conf":float(ln.get('conf',-1.0)),"text":t,"line_box":ln.get('bbox'),"table_kind":"curve_table"})
-            pairs=extract_pairs_from_line(ln, dot_ref=v["dot"], line_mask=v["mask"], num_timeout=num_timeout)
-            for p in pairs:
-                p["ref_id"]=rid
-                p["table_kind"]="line_table" if rid.startswith("L") else "curve_table"
-                out.append(p)
-    return out, curvep
-
-# ----------------- clustering / voting -----------------
-
-def similar(a: dict, b: dict, dist_tol: float, bear_tol: float) -> bool:
-    if (a.get("ref_id") or None) != (b.get("ref_id") or None): return False
-    if (a.get("table_kind") or None) != (b.get("table_kind") or None): return False
-    qa=a["bearing"].split()[0]+a["bearing"].split()[-1]
-    qb=b["bearing"].split()[0]+b["bearing"].split()[-1]
-    if qa!=qb: return False
-    if abs(float(a["numeric_dist"])-float(b["numeric_dist"]))>dist_tol: return False
-    ta,tb=a.get("theta"),b.get("theta")
-    if ta is None or tb is None: return False
-    d=abs(float(ta)-float(tb)); d=min(d,360.0-d)
-    return d<=bear_tol
-
-def cluster(cands: list[dict], dist_tol: float, bear_tol: float) -> list[list[dict]]:
-    cl=[]
-    for c in cands:
-        placed=False
-        for g in cl:
-            if similar(c, g[0], dist_tol, bear_tol):
-                g.append(c); placed=True; break
-        if not placed: cl.append([c])
-    return cl
-
-def score(c: dict) -> float:
-    conf=float(c.get("conf",-1.0))
-    ov=float(c.get("line_overlap",0.0))
-    q=c.get("dist_quality","")
-    bonus = 2.2 if q=="explicit_decimal" else (1.3 if q=="dot_blob" else 0.0)
-    return conf + bonus - 3.5*ov
-
-def winner(group: list[dict]) -> dict:
-    cnt=Counter((c["bearing"],c["distance"],c.get("record_distance") or None) for c in group)
-    bestk=max(cnt, key=lambda k: cnt[k])
-    reps=[c for c in group if (c["bearing"],c["distance"],c.get("record_distance") or None)==bestk]
-    reps.sort(key=score, reverse=True)
-    out=dict(reps[0]); out["support"]=int(cnt[bestk]); out["vote_score"]=float(score(reps[0]))
-    return out
-
-# ----------------- basis of bearing -----------------
-
-@dataclass
-class TextLine:
-    text: str
-    conf: float
-    bbox: tuple[int,int,int,int]
-    page: int
-    dpi: int
-    rot: float
-
-def basis_of_bearing(text_lines: list[TextLine], pairs: list[dict]) -> Optional[dict]:
-    basis=[ln for ln in text_lines if BASIS_RE.search(ln.text or "")]
-    if not basis: return None
-    basis.sort(key=lambda ln: ln.conf, reverse=True)
-    lab=basis[0]
-    bx1,by1,bx2,by2=lab.bbox
-    bcx,bcy=(bx1+bx2)/2.0,(by1+by2)/2.0
-    best=None; bestd=1e18
-    for p in pairs:
-        if p.get("page")!=lab.page or p.get("dpi")!=lab.dpi or float(p.get("det_rotation",0.0))!=float(lab.rot):
-            continue
-        bb=p.get("bbox_page")
-        if not bb: continue
-        x1,y1,x2,y2=bb; ccx,ccy=(x1+x2)/2.0,(y1+y2)/2.0
-        dy=ccy-bcy
-        if dy<-120: continue
-        d=(ccx-bcx)**2+(ccy-bcy)**2
-        if d<bestd: bestd=d; best=p
-    out={"basis_text":lab.text,"page":lab.page,"dpi":lab.dpi,"det_rotation":lab.rot,"label_bbox":lab.bbox}
-    if best:
-        out.update({"bearing":best["bearing"],"distance":best["distance"],"record_distance":best.get("record_distance")})
-    return out
-
-# ----------------- main extraction -----------------
-
-def parse_pages(spec: str, max_pages: int) -> list[int]:
-    if not spec: return list(range(1,max_pages+1))
-    out=set()
-    for part in spec.split(","):
-        part=part.strip()
-        if not part: continue
-        if "-" in part:
-            a,b=part.split("-",1)
-            try:
-                a=int(a); b=int(b)
-                for p in range(max(1,a), min(max_pages,b)+1): out.add(p)
-            except ValueError:
-                pass
-        else:
-            try:
-                p=int(part)
-                if 1<=p<=max_pages: out.add(p)
-            except ValueError:
-                pass
-    return sorted(out) if out else list(range(1,max_pages+1))
-
-def process_page(page_img: Image.Image, page_num: int, dpi: int, rotations: list[float],
-                 do_lineclean: bool, do_tables: bool, threads: int,
-                 tess_timeout: Optional[int], num_timeout: Optional[int],
-                 max_crops: int) -> tuple[list[dict], list[dict], list[TextLine]]:
-    W,H=page_img.size
-    all_pairs=[]; curve_params=[]; all_lines=[]
-
-    def process_rotation(rot: float):
-        rot_img=rotate_keep(page_img, rot)
-        quads=detect_text_quads(rot_img)[:max_crops]
-        page_gray=to_gray(rot_img)
-        page_lm=build_line_mask(page_gray)
-
-        pairs=[]; curvep=[]; lines=[]
-        def crop_worker(quad: np.ndarray):
-            crop=warp_quad(rot_img, quad, pad=6)
-            vars=preprocess_variants(crop, do_lineclean=do_lineclean)
-            cfgs=[
-                ("--oem 3 --psm 6 -c preserve_interword_spaces=1 -c tessedit_enable_dict_correction=0 -c load_system_dawg=0 -c load_freq_dawg=0 -c tessedit_char_whitelist=0123456789NSEWnsewLC.,-°oº()' ","psm6"),
-                ("--oem 3 --psm 11 -c preserve_interword_spaces=1 -c tessedit_enable_dict_correction=0 -c load_system_dawg=0 -c load_freq_dawg=0 -c tessedit_char_whitelist=0123456789NSEWnsewLC.,-°oº()' ","psm11"),
-            ]
-            local_pairs=[]; local_curvep=[]; local_lines=[]
-            for v in vars:
-                for cfg,_ in cfgs:
-                    for ln in ocr_lines(v["pil"], cfg, timeout=tess_timeout):
-                        t=norm(ln["text"])
-                        if not t: continue
-                        if BASIS_RE.search(t):
-                            bb_orig=quad_to_bbox_original(quad, W, H, rot)
-                            local_lines.append(TextLine(text=t, conf=float(ln["conf"]), bbox=bb_orig, page=page_num, dpi=dpi, rot=rot))
-                        cp = curve_params_from_line(ln)
-                        if cp:
-                            cp["page"]=page_num; cp["dpi"]=dpi; cp["det_rotation"]=rot
-                            cp["bbox_page"]=quad_to_bbox_original(quad, W, H, rot)
-                            cp["source"]="callout"
-                            local_curvep.append(cp)
-                        for p in extract_pairs_from_line(ln, dot_ref=v["dot"], line_mask=v["mask"], num_timeout=num_timeout):
-                            if ln.get("bbox"):
-                                ov=overlap(page_lm, ln["bbox"])
-                                p["line_overlap"]=float(min(1.0, 0.7*float(p.get("line_overlap",0.0))+0.3*ov))
-                            p["page"]=page_num; p["dpi"]=dpi; p["det_rotation"]=rot
-                            p["bbox_page"]=quad_to_bbox_original(quad, W, H, rot)
-                            p["source"]="callout"
-                            local_pairs.append(p)
-            return local_pairs, local_curvep, local_lines
-
-        with ThreadPoolExecutor(max_workers=max(1,threads)) as ex:
-            futs=[ex.submit(crop_worker, q) for q in quads]
-            for fut in as_completed(futs):
-                lp, lcp, ll = fut.result()
-                pairs.extend(lp); curvep.extend(lcp); lines.extend(ll)
-
-        if do_tables:
-            rects=detect_table_rects(rot_img)
-            for r in rects:
-                x1,y1,x2,y2=r
-                roi=rot_img.crop((x1,y1,x2,y2))
-                tbl, tcurvep=parse_table_roi(roi, do_lineclean=do_lineclean, tess_timeout=tess_timeout, num_timeout=num_timeout)
-                for cp in tcurvep:
-                    cp["page"]=page_num; cp["dpi"]=dpi; cp["det_rotation"]=rot
-                    q=np.array([[x1,y1],[x2,y1],[x2,y2],[x1,y2]], dtype=np.float32)
-                    cp["bbox_page"]=quad_to_bbox_original(q, W, H, rot)
-                    cp["source"]="table"
-                    curvep.append(cp)
-                for p in tbl:
-                    p["page"]=page_num; p["dpi"]=dpi; p["det_rotation"]=rot
-                    q=np.array([[x1,y1],[x2,y1],[x2,y2],[x1,y2]], dtype=np.float32)
-                    p["bbox_page"]=quad_to_bbox_original(q, W, H, rot)
-                    p["source"]="table"
-                    pairs.append(p)
-
-        return pairs, curvep, lines
-
-    # rotations sequential to avoid oversubscription; per-rotation crops are parallel
-    for r in rotations:
-        pairs, cp, lines = process_rotation(float(r))
-        all_pairs.extend(pairs)
-        curve_params.extend(cp)
-        all_lines.extend(lines)
-
-    return all_pairs, curve_params, all_lines
-
-def extract(pdf: Path, dpis: list[int], pages: list[int], rotations: list[float], threads: int,
-            do_lineclean: bool, do_tables: bool,
-            tess_timeout: Optional[int], num_timeout: Optional[int],
-            dist_tol: float, bear_tol: float, min_support: int, max_crops: int) -> dict:
-    out_pairs=[]; out_curve_params=[]; text_lines=[]
-
-    for dpi in dpis:
-        for p in pages:
-            imgs=convert_from_path(str(pdf), dpi=int(dpi), first_page=p, last_page=p)
-            if not imgs:
-                continue
-            img=imgs[0]
-            pairs, curvep, lines = process_page(img, p, dpi, rotations, do_lineclean, do_tables, threads, tess_timeout, num_timeout, max_crops)
-            out_pairs.extend(pairs); out_curve_params.extend(curvep); text_lines.extend(lines)
-
-    clusters=cluster(out_pairs, dist_tol=dist_tol, bear_tol=bear_tol)
-    winners=[winner(g) for g in clusters if len(g)>0]
-    winners=[w for w in winners if int(w.get("support",1))>=min_support]
-    winners.sort(key=lambda x:(x.get("ref_id") is not None, x.get("support",1), x.get("vote_score",-1e9)), reverse=True)
-
-    counts=defaultdict(int)
-    for w in winners:
-        if w.get("ref_id"): counts[w["ref_id"]]+=1
-    for w in winners:
-        w["callout_count"]=int(counts.get(w.get("ref_id"),0))
-
-    basis=basis_of_bearing(text_lines, winners)
-
-    return {
-        "file": str(pdf),
-        "dpis": dpis,
-        "pages": pages,
-        "rotations": rotations,
-        "threads": threads,
-        "lineclean": bool(do_lineclean),
-        "tables": bool(do_tables),
-        "dist_tol_ft": dist_tol,
-        "bear_tol_deg": bear_tol,
-        "min_support": min_support,
-        "basis_of_bearing": basis,
-        "curve_params": [{
-            "source": c.get("source"),
-            "table_kind": c.get("table_kind"),
-            "ref_id": c.get("ref_id"),
-            "curve": c.get("curve"),
-            "conf": float(c.get("conf",-1.0)),
-            "page": int(c.get("page",0)),
-            "det_rotation": float(c.get("det_rotation",0.0)),
-            "bbox_page": c.get("bbox_page"),
-            "text": c.get("text"),
-        } for c in out_curve_params],
-        "pairs": [{
-            "source": w.get("source"),
-            "table_kind": w.get("table_kind"),
-            "ref_id": w.get("ref_id"),
-            "bearing": w["bearing"],
-            "distance": w["distance"],
-            "record_distance": w.get("record_distance"),
-            "curve": w.get("curve"),
-            "callout_count": int(w.get("callout_count",0)),
-            "support": int(w.get("support",1)),
-            "vote_score": float(w.get("vote_score",0.0)),
-            "conf": float(w.get("conf",-1.0)),
-            "line_overlap": float(w.get("line_overlap",0.0)),
-            "dist_quality": w.get("dist_quality"),
-            "bbox_page": w.get("bbox_page"),
-            "page": int(w.get("page",0)),
-            "det_rotation": float(w.get("det_rotation",0.0)),
-        } for w in winners],
-        "count": len(winners),
-    }
-
-def draw_debug(pdf: Path, dpi: int, pages: list[int], result: dict, out_png: Path):
-    if not pages: return
-    p=pages[0]
-    imgs=convert_from_path(str(pdf), dpi=int(dpi), first_page=p, last_page=p)
-    if not imgs: return
-    img=imgs[0].convert("RGB")
-    arr=np.array(img)
-    for w in result.get("pairs",[]):
-        if int(w.get("page",0))!=p: continue
-        bb=w.get("bbox_page")
-        if not bb: continue
-        x1,y1,x2,y2 = map(int, bb)
-        cv2.rectangle(arr, (x1,y1), (x2,y2), (0,255,0), 2)
-        lab = (w.get("ref_id") or "") + " " + (w.get("distance") or "")
-        cv2.putText(arr, lab[:22], (x1, max(18,y1-6)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0,255,0), 2, cv2.LINE_AA)
-    Image.fromarray(arr).save(out_png)
-
-def main():
-    ap=argparse.ArgumentParser()
-    ap.add_argument("pdf")
-    ap.add_argument("--dpi", type=int, default=650)
-    ap.add_argument("--dpis", default="", help="comma list, overrides --dpi")
-    ap.add_argument("--pages", default="", help="e.g. 1-2,4")
-    ap.add_argument("--rotations", default="0,90,180,270")
-    ap.add_argument("--threads", type=int, default=12)
-    ap.add_argument("--omp-thread-limit", type=int, default=None)
-    ap.add_argument("--no-lineclean", action="store_true")
-    ap.add_argument("--no-tables", action="store_true")
-    ap.add_argument("--tess-timeout", type=int, default=0)
-    ap.add_argument("--number-timeout", type=int, default=0)
-    ap.add_argument("--dist-tol", type=float, default=0.20)
-    ap.add_argument("--bear-tol", type=float, default=0.35)
-    ap.add_argument("--min-support", type=int, default=2)
-    ap.add_argument("--max-crops", type=int, default=1100)
-    ap.add_argument("--out", default="out.json")
-    ap.add_argument("--annotate", default="")
-    ap.add_argument("--verbose", action="store_true")
-    args=ap.parse_args()
-
-    if args.omp_thread_limit is not None:
-        os.environ["OMP_THREAD_LIMIT"]=str(int(args.omp_thread_limit))
-    else:
-        if args.threads>1 and "OMP_THREAD_LIMIT" not in os.environ:
-            os.environ["OMP_THREAD_LIMIT"]="1"
-
-    pdf=Path(args.pdf)
-    if not pdf.is_file():
-        print("File not found"); sys.exit(1)
-
-    info=pdfinfo_from_path(str(pdf))
-    max_pages=int(info.get("Pages",1))
-    pages=parse_pages(args.pages, max_pages=max_pages)
-    rotations=[float(x.strip()) for x in args.rotations.split(",") if x.strip()]
-
-    tess_timeout = int(args.tess_timeout) if args.tess_timeout>0 else None
-    num_timeout  = int(args.number_timeout) if args.number_timeout>0 else None
-
-    dpis = [int(x) for x in args.dpis.split(',') if x.strip().isdigit()] if args.dpis else [int(args.dpi)]
-
-    res=extract(
-        pdf=pdf, dpis=dpis, pages=pages, rotations=rotations,
-        threads=max(1,int(args.threads)),
-        do_lineclean=not args.no_lineclean,
-        do_tables=not args.no_tables,
-        tess_timeout=tess_timeout, num_timeout=num_timeout,
-        dist_tol=float(args.dist_tol), bear_tol=float(args.bear_tol),
-        min_support=int(args.min_support), max_crops=int(args.max_crops)
+# ---------------------------
+# Linework detection + cleanup
+# ---------------------------
+def _adaptive_inv(gray: np.ndarray) -> np.ndarray:
+    return cv2.adaptiveThreshold(
+        gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV, 31, 10
     )
 
-    with open(args.out,"w") as f:
-        json.dump(res,f,indent=2)
-    print(f"Saved {args.out}  pairs={res.get('count')}")
+def build_line_mask(gray: np.ndarray) -> np.ndarray:
+    h, w = gray.shape[:2]
+    bw = _adaptive_inv(gray)
 
-    if args.verbose:
-        for i,p in enumerate(res.get("pairs",[]),1):
-            rid=p.get("ref_id") or ""
-            tk=f"[{p.get('table_kind')}]" if p.get("table_kind") else ""
-            rec=f" ({p.get('record_distance')})" if p.get("record_distance") else ""
-            print(f"{i:3d}. {tk} {rid:5s} {p['bearing']:22s} {p['distance']:>10s}{rec} ft  support={p['support']} score={p['vote_score']:.2f} overlap={p['line_overlap']:.2f}")
+    hk = max(25, w // 18)
+    vk = max(25, h // 18)
 
-        if res.get("basis_of_bearing"):
-            b=res["basis_of_bearing"]
-            print("\nBasis of Bearing:", b.get("basis_text"))
-            if b.get("bearing"): print("  ->", b.get("bearing"), b.get("distance"), "ft")
+    horiz = cv2.morphologyEx(
+        bw, cv2.MORPH_OPEN,
+        cv2.getStructuringElement(cv2.MORPH_RECT, (hk, 1)),
+        iterations=1
+    )
+    vert = cv2.morphologyEx(
+        bw, cv2.MORPH_OPEN,
+        cv2.getStructuringElement(cv2.MORPH_RECT, (1, vk)),
+        iterations=1
+    )
 
-        if res.get("curve_params"):
-            print(f"\nCurve-only params captured: {len(res.get('curve_params',[]))}")
+    mask = cv2.bitwise_or(horiz, vert)
 
-    if args.annotate:
-        draw_debug(pdf, int(dpis[0]), pages, res, Path(args.annotate))
-        print(f"Saved debug overlay {args.annotate}")
+    edges = cv2.Canny(gray, 60, 160)
+    min_len = max(60, int(0.28 * min(w, h)))
+    lines = cv2.HoughLinesP(
+        edges, 1, np.pi / 180,
+        threshold=70,
+        minLineLength=min_len,
+        maxLineGap=12
+    )
 
-if __name__=="__main__":
+    if lines is not None:
+        diag = np.zeros_like(mask)
+        for x1, y1, x2, y2 in lines[:, 0]:
+            if (x2 - x1) ** 2 + (y2 - y1) ** 2 < (min_len ** 2):
+                continue
+            cv2.line(diag, (x1, y1), (x2, y2), 255, 3)
+        mask = cv2.bitwise_or(mask, diag)
+
+    mask = cv2.dilate(mask, np.ones((3, 3), np.uint8), iterations=1)
+    return mask
+
+def remove_linework(gray: np.ndarray, radius: int) -> tuple[np.ndarray, np.ndarray]:
+    mask = build_line_mask(gray)
+    cleaned = cv2.inpaint(gray, mask, inpaintRadius=int(radius), flags=cv2.INPAINT_TELEA)
+    return cleaned, mask
+
+def mask_overlap_ratio(mask: np.ndarray, bbox: tuple[int, int, int, int]) -> float:
+    x1, y1, x2, y2 = bbox
+    x1 = max(0, x1); y1 = max(0, y1)
+    x2 = min(mask.shape[1], x2); y2 = min(mask.shape[0], y2)
+    if x2 <= x1 or y2 <= y1:
+        return 0.0
+    roi = mask[y1:y2, x1:x2]
+    return float(np.count_nonzero(roi)) / float(roi.size)
+
+# ---------------------------
+# Decimal dot detection (pixel evidence)
+# ---------------------------
+def _binarize_for_components(gray: np.ndarray) -> np.ndarray:
+    if gray.dtype != np.uint8:
+        gray = np.clip(gray, 0, 255).astype(np.uint8)
+    _, bw = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)
+    return bw
+
+def detect_decimal_dot_digits_right(dot_ref_pil: Image.Image, word_bbox: tuple[int, int, int, int]) -> int | None:
+    """
+    Returns N = number of digit-components to the RIGHT of a dot blob, if a dot blob is detected.
+    Used to reconstruct missing decimal points from pixel evidence (not digit-length guessing).
+    """
+    x1, y1, x2, y2 = word_bbox
+    w = max(1, x2 - x1)
+    h = max(1, y2 - y1)
+
+    mx = max(2, int(w * 0.08))
+    my = max(2, int(h * 0.12))
+    X1 = max(0, x1 - mx)
+    Y1 = max(0, y1 - my)
+    X2 = min(dot_ref_pil.size[0], x2 + mx)
+    Y2 = min(dot_ref_pil.size[1], y2 + my)
+
+    crop = dot_ref_pil.crop((X1, Y1, X2, Y2))
+    gray = np.array(crop.convert("L"))
+
+    bw = _binarize_for_components(gray)
+    n, labels, stats, centroids = cv2.connectedComponentsWithStats(bw, connectivity=8)
+    if n <= 2:
+        return None
+
+    comps = []
+    for i in range(1, n):
+        x, y, cw, ch, area = stats[i]
+        if area <= 0:
+            continue
+        comps.append((i, x, y, cw, ch, area, float(centroids[i][0]), float(centroids[i][1])))
+    if not comps:
+        return None
+
+    areas = sorted([c[5] for c in comps], reverse=True)
+    top = areas[:6]
+    median_big = float(np.median(top)) if top else 0.0
+    if median_big <= 0:
+        return None
+
+    digit_comps = []
+    for (i, x, y, cw, ch, area, cx, cy) in comps:
+        if area < max(6, 0.10 * median_big):
+            continue
+        digit_comps.append((i, x, y, cw, ch, area, cx, cy))
+    if len(digit_comps) < 2:
+        return None
+
+    digit_cys = [c[7] for c in digit_comps]
+    cy_med = float(np.median(digit_cys))
+
+    dot_candidates = []
+    for (i, x, y, cw, ch, area, cx, cy) in comps:
+        if area >= 0.35 * median_big:
+            continue
+        if area < 2:
+            continue
+        if cw > 0.40 * w or ch > 0.40 * h:
+            continue
+        fill = area / max(1.0, float(cw * ch))
+        if fill < 0.20:
+            continue
+        if not (cy >= 0.50 * h and cy <= 0.95 * h):
+            continue
+        if cy < cy_med:
+            continue
+        ar = cw / max(1.0, float(ch))
+        ar = ar if ar >= 1.0 else 1.0 / ar
+        if ar > 3.0:
+            continue
+
+        score = 0.0
+        score += (1.0 - min(1.0, area / (0.35 * median_big))) * 2.0
+        score += (1.0 - min(1.0, (ar - 1.0) / 2.0)) * 1.5
+        score += (min(1.0, (cy - cy_med) / max(1.0, (0.40 * h)))) * 1.0
+        score += fill * 0.8
+        dot_candidates.append((score, cx, cy, i))
+
+    if not dot_candidates:
+        return None
+
+    dot_candidates.sort(key=lambda t: t[0], reverse=True)
+    _, dot_cx, _dot_cy, _ = dot_candidates[0]
+
+    digit_centers_x = sorted([c[6] for c in digit_comps])
+    right = [x for x in digit_centers_x if x > dot_cx + 1.5]
+    left = [x for x in digit_centers_x if x < dot_cx - 1.5]
+    digits_right = len(right)
+
+    if digits_right < 1 or len(left) < 1:
+        return None
+    if digits_right > 4:
+        return None
+
+    return digits_right
+
+# ---------------------------
+# Distance parsing (NO digit-length guessing)
+# ---------------------------
+def parse_distance_with_quality(
+    dist_text: str,
+    dot_digits_right: int | None = None,
+    min_ft: float = 1.0,
+    max_ft: float = 50_000_000.0,
+) -> tuple[float | None, str]:
+    if not dist_text:
+        return None, "invalid"
+
+    s = (dist_text or "").strip().replace(" ", "")
+    s = s.replace("·", ".").replace("•", ".").replace("∙", ".").replace("⋅", ".")
+
+    # measured distance token may include "(124)" glued; strip it
+    if "(" in s:
+        s = s.split("(", 1)[0].strip()
+    if not s:
+        return None, "invalid"
+
+    # comma-as-decimal fix ONLY when clearly a decimal comma (NOT length based)
+    if s.count(",") == 1 and "." not in s:
+        left, right = s.split(",", 1)
+        if right.isdigit() and len(right) in (2, 3) and left.replace(",", "").isdigit():
+            s2 = (left + "." + right).translate(DIGIT_FIX)
+            try:
+                v = float(s2)
+                if min_ft <= v <= max_ft:
+                    return v, "comma_decimal"
+            except ValueError:
+                pass
+
+    s = s.replace(",", "")
+    s = s.translate(DIGIT_FIX)
+
+    # explicit decimal wins
+    if "." in s:
+        parts = s.split(".")
+        s = parts[0] + "." + "".join(parts[1:])
+        try:
+            v = float(s)
+            if min_ft <= v <= max_ft:
+                return v, "explicit_decimal"
+        except ValueError:
+            return None, "invalid"
+
+    digits = re.sub(r"\D", "", s)
+    if not digits:
+        return None, "invalid"
+
+    # pixel-dot evidence insertion
+    if dot_digits_right is not None:
+        if 1 <= dot_digits_right < len(digits):
+            ins = len(digits) - dot_digits_right
+            s2 = digits[:ins] + "." + digits[ins:]
+            try:
+                v = float(s2)
+                if min_ft <= v <= max_ft:
+                    return v, "dot_blob"
+            except ValueError:
+                pass
+
+    # integer fallback
+    try:
+        v = float(digits)
+        if min_ft <= v <= max_ft:
+            return v, "integer"
+    except ValueError:
+        pass
+
+    return None, "invalid"
+
+# ---------------------------
+# Rotation helpers
+# ---------------------------
+def rotate_keep_size(pil_img: Image.Image, angle_deg: float) -> Image.Image:
+    a = float(angle_deg)
+    if abs(a) < 1e-9:
+        return pil_img
+
+    arr = np.array(pil_img.convert("RGB"))
+    h, w = arr.shape[:2]
+
+    # exact multiples fast path
+    am = (a % 360.0)
+    if abs(am - 90.0) < 1e-9:
+        out = cv2.rotate(arr, cv2.ROTATE_90_COUNTERCLOCKWISE)
+        if (out.shape[1], out.shape[0]) != (w, h):
+            out = cv2.resize(out, (w, h), interpolation=cv2.INTER_CUBIC)
+        return Image.fromarray(out)
+    if abs(am - 270.0) < 1e-9:
+        out = cv2.rotate(arr, cv2.ROTATE_90_CLOCKWISE)
+        if (out.shape[1], out.shape[0]) != (w, h):
+            out = cv2.resize(out, (w, h), interpolation=cv2.INTER_CUBIC)
+        return Image.fromarray(out)
+    if abs(am - 180.0) < 1e-9:
+        return Image.fromarray(cv2.rotate(arr, cv2.ROTATE_180))
+
+    center = (w / 2.0, h / 2.0)
+    M = cv2.getRotationMatrix2D(center, a, 1.0)
+    out = cv2.warpAffine(
+        arr, M, (w, h),
+        flags=cv2.INTER_CUBIC,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=(255, 255, 255),
+    )
+    return Image.fromarray(out)
+
+# ---------------------------
+# Preprocess variants
+# ---------------------------
+def _apply_clahe(gray: np.ndarray, clip: float = 2.0, grid: int = 8) -> np.ndarray:
+    clahe = cv2.createCLAHE(clipLimit=float(clip), tileGridSize=(int(grid), int(grid)))
+    return clahe.apply(gray)
+
+def preprocess_variant(pil_img: Image.Image, variant: dict) -> tuple[Image.Image, dict]:
+    arr = np.array(pil_img.convert("RGB"))
+    gray0 = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
+
+    if variant.get("clahe", False):
+        gray0 = _apply_clahe(gray0, clip=variant.get("clahe_clip", 2.0), grid=variant.get("clahe_grid", 8))
+
+    scale = float(variant.get("scale", 1.0))
+    base_pixels = int(gray0.shape[0] * gray0.shape[1])
+    if base_pixels > 0 and scale != 1.0:
+        target = base_pixels * (scale * scale)
+        if target > MAX_VARIANT_PIXELS:
+            scale = (MAX_VARIANT_PIXELS / base_pixels) ** 0.5
+
+    if scale != 1.0:
+        gray = cv2.resize(gray0, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+    else:
+        gray = gray0
+
+    line_mask = build_line_mask(gray) if bool(variant.get("line_mask", True)) else None
+
+    if bool(variant.get("line_clean", False)):
+        gray, _ = remove_linework(gray, radius=int(variant.get("inpaint_radius", 3)))
+
+    inv = bool(variant.get("inv", False))
+    thresh = variant.get("thresh", "adaptive_gauss")
+    blur = int(variant.get("blur", 0) or 0)
+
+    if thresh == "none":
+        out = 255 - gray if inv else gray
+        proc = Image.fromarray(out)
+        return proc, {"scaled_gray": gray, "line_mask": line_mask, "dot_ref": bool(variant.get("dot_ref", False)), "scale_used": float(scale)}
+
+    gray2 = gray
+    if blur > 0:
+        k = blur if blur % 2 == 1 else blur + 1
+        gray2 = cv2.GaussianBlur(gray2, (k, k), 0)
+
+    block_size = int(variant.get("block_size", 31))
+    if block_size < 11:
+        block_size = 11
+    if block_size % 2 == 0:
+        block_size += 1
+    C = int(variant.get("C", 10))
+
+    if thresh == "adaptive_gauss":
+        out = cv2.adaptiveThreshold(
+            gray2, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY_INV if inv else cv2.THRESH_BINARY, block_size, C
+        )
+    elif thresh == "adaptive_mean":
+        out = cv2.adaptiveThreshold(
+            gray2, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
+            cv2.THRESH_BINARY_INV if inv else cv2.THRESH_BINARY, block_size, C
+        )
+    elif thresh == "otsu":
+        mode = (cv2.THRESH_BINARY_INV if inv else cv2.THRESH_BINARY) | cv2.THRESH_OTSU
+        _, out = cv2.threshold(gray2, 0, 255, mode)
+    else:
+        out = gray2
+
+    if bool(variant.get("denoise", False)):
+        out = cv2.fastNlMeansDenoising(out, None, h=25, templateWindowSize=7, searchWindowSize=21)
+
+    if bool(variant.get("morph_close", False)):
+        kernel = np.ones((2, 2), np.uint8)
+        out = cv2.morphologyEx(out, cv2.MORPH_CLOSE, kernel, iterations=1)
+
+    proc = Image.fromarray(out)
+    return proc, {"scaled_gray": gray, "line_mask": line_mask, "dot_ref": bool(variant.get("dot_ref", False)), "scale_used": float(scale)}
+
+# ---------------------------
+# OCR: Tesseract (word bboxes)
+# ---------------------------
+def ocr_image_to_lines_with_words_tesseract(pil_img: Image.Image, config: str, timeout: int | None = None) -> list[dict]:
+    data = pytesseract.image_to_data(
+        pil_img, config=config, lang="eng", output_type=Output.DICT,
+        timeout=timeout
+    )
+
+    n = len(data.get("text", []))
+    lines: dict[tuple[int, int, int], dict] = {}
+
+    for i in range(n):
+        txt = (data["text"][i] or "").strip()
+        if not txt:
+            continue
+
+        conf_raw = data.get("conf", ["-1"])[i]
+        try:
+            conf = float(conf_raw)
+        except Exception:
+            conf = -1.0
+
+        block = int(data.get("block_num", [0])[i] or 0)
+        par = int(data.get("par_num", [0])[i] or 0)
+        line = int(data.get("line_num", [0])[i] or 0)
+        key = (block, par, line)
+
+        x, y, w, h = int(data["left"][i]), int(data["top"][i]), int(data["width"][i]), int(data["height"][i])
+        bb = (x, y, x + w, y + h)
+
+        if key not in lines:
+            lines[key] = {"words": [], "bbox": [x, y, x + w, y + h], "confs": []}
+
+        lines[key]["words"].append({"text": txt, "conf": conf, "bbox": bb})
+
+        L = lines[key]["bbox"]
+        L[0] = min(L[0], x)
+        L[1] = min(L[1], y)
+        L[2] = max(L[2], x + w)
+        L[3] = max(L[3], y + h)
+
+        if conf >= 0:
+            lines[key]["confs"].append(conf)
+
+    out = []
+    for rec in lines.values():
+        words = rec["words"]
+        words.sort(key=lambda w: w["bbox"][0])
+        text = " ".join(w["text"] for w in words)
+        confs = rec["confs"]
+        mean_conf = (sum(confs) / len(confs)) if confs else -1.0
+        out.append({"text": text, "conf": mean_conf, "bbox": tuple(rec["bbox"]), "words": words})
+
+    out.sort(key=lambda r: (r["bbox"][1], r["bbox"][0]))
+    return out
+
+# ---------------------------
+# OCR: PaddleOCR wrapper (FIXED for v3.x)
+# ---------------------------
+class PaddleOcrEngine:
+    """
+    PaddleOCR wrapper compatible with PaddleOCR 2.x and 3.x:
+      - NO show_log arg (removed in 3.x)
+      - uses use_textline_orientation when available; fallback to use_angle_cls
+      - normalizes output to list-of-lines: [[quad, (text, score)], ...]
+    """
+    def __init__(self, lang="en"):
+        # Reduce logs (best-effort)
+        os.environ.setdefault("FLAGS_minlog_level", "3")
+        os.environ.setdefault("GLOG_minloglevel", "3")
+        os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
+
+        if not _PADDLE_OK:
+            raise RuntimeError("PaddleOCR not installed")
+
+        self.ocr = None
+        last_err = None
+
+        # Try PaddleOCR 3.x preferred arg, then PaddleOCR 2.x arg, then none
+        for extra in (
+            {"use_textline_orientation": True},
+            {"use_angle_cls": True},
+            {},
+        ):
+            try:
+                self.ocr = PaddleOCR(lang=lang, **extra)
+                self._init_extra = extra
+                break
+            except Exception as e:
+                last_err = e
+
+        if self.ocr is None:
+            raise last_err
+
+    def ocr_image(self, pil_img: Image.Image, timeout: int | None = None):
+        import numpy as np
+
+        img = np.array(pil_img.convert("RGB"))
+        try:
+            raw = self.ocr.ocr(img, cls=False)
+        except TypeError:
+            raw = self.ocr.ocr(img)
+
+        # PaddleOCR 3.x returns OCRResult objects with .json payload
+        if raw and hasattr(raw[0], "json"):
+            page_lines = []
+            for res_obj in raw:
+                payload = res_obj.json
+                if isinstance(payload, dict) and "res" in payload:
+                    payload = payload["res"]
+
+                texts = payload.get("rec_texts", []) or []
+                scores = payload.get("rec_scores", []) or []
+                polys = payload.get("rec_polys", None)
+
+                try:
+                    scores = scores.tolist()
+                except Exception:
+                    pass
+                if polys is not None:
+                    try:
+                        polys = polys.tolist()
+                    except Exception:
+                        pass
+
+                if polys is None:
+                    polys = payload.get("dt_polys", None)
+                    if polys is not None:
+                        try:
+                            polys = polys.tolist()
+                        except Exception:
+                            pass
+
+                n = min(len(texts), len(scores), len(polys) if polys is not None else len(texts))
+                for i in range(n):
+                    quad = polys[i] if polys is not None else [[0, 0], [0, 0], [0, 0], [0, 0]]
+                    txt = texts[i]
+                    sc = float(scores[i]) if i < len(scores) else 0.0
+                    page_lines.append([quad, (txt, sc)])
+
+            return [page_lines]
+
+        # PaddleOCR 2.x returns list-of-lines already
+        return raw if raw is not None else [[]]
+
+# ---------------------------
+# OCR: DocTR wrapper (optional, uses torch device if available)
+# ---------------------------
+class DoctrOcrEngine:
+    """
+    DocTR OCR wrapper.
+    Produces list-of-lines similar to Paddle:
+      [[quad, (text, score)], ...]
+    """
+    def __init__(self):
+        if not _DOCTR_OK:
+            raise RuntimeError("DocTR not installed")
+
+        # choose device: MPS > CUDA > CPU (best-effort)
+        self.device = "cpu"
+        try:
+            import torch
+            if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+                self.device = "mps"
+            elif torch.cuda.is_available():
+                self.device = "cuda"
+        except Exception:
+            self.device = "cpu"
+
+        # high-quality default predictor
+        self.predictor = ocr_predictor(pretrained=True).to(self.device)
+
+    def ocr_image(self, pil_img: Image.Image):
+        # DocumentFile wants list of images; easiest: convert PIL->numpy and use from_images
+        arr = np.array(pil_img.convert("RGB"))
+        doc = DocumentFile.from_images([arr])
+        res = self.predictor(doc)
+        exported = res.export()
+
+        # exported structure:
+        # {'pages':[{'blocks':[{'lines':[{'words':[{'value':...,'geometry':((x1,y1),(x2,y2))}, ...]}]}]}]}]}
+        page = exported["pages"][0]
+        H, W = pil_img.size[1], pil_img.size[0]
+
+        out_lines = []
+        for block in page.get("blocks", []):
+            for line in block.get("lines", []):
+                words = line.get("words", [])
+                if not words:
+                    continue
+                text = " ".join(w.get("value", "") for w in words).strip()
+                if not text:
+                    continue
+
+                # geometry is relative (0..1); convert to px bbox
+                xs = []
+                ys = []
+                confs = []
+                for w in words:
+                    geom = w.get("geometry", None)
+                    conf = w.get("confidence", None)
+                    if isinstance(conf, (int, float)):
+                        confs.append(float(conf))
+                    if geom and isinstance(geom, (list, tuple)) and len(geom) == 2:
+                        (x1, y1), (x2, y2) = geom
+                        xs += [x1, x2]
+                        ys += [y1, y2]
+                if not xs or not ys:
+                    continue
+
+                x1 = int(min(xs) * W)
+                y1 = int(min(ys) * H)
+                x2 = int(max(xs) * W)
+                y2 = int(max(ys) * H)
+
+                quad = [[x1, y1], [x2, y1], [x2, y2], [x1, y2]]
+                score = float(np.mean(confs)) if confs else 0.5
+                out_lines.append([quad, (text, score)])
+
+        return [out_lines]
+
+# ---------------------------
+# Geometry helpers
+# ---------------------------
+def clamp_rect(r, w, h):
+    x1, y1, x2, y2 = r
+    x1 = max(0, min(w - 1, int(x1)))
+    y1 = max(0, min(h - 1, int(y1)))
+    x2 = max(1, min(w, int(x2)))
+    y2 = max(1, min(h, int(y2)))
+    if x2 <= x1 + 1:
+        x2 = min(w, x1 + 2)
+    if y2 <= y1 + 1:
+        y2 = min(h, y1 + 2)
+    return (x1, y1, x2, y2)
+
+def rect_intersects(a, b) -> bool:
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+    return not (ax2 < bx1 or bx2 < ax1 or ay2 < by1 or by2 < ay1)
+
+def merge_rects(rects: list[tuple[int, int, int, int]]) -> list[tuple[int, int, int, int]]:
+    rects = rects[:]
+    merged = True
+    while merged and len(rects) > 1:
+        merged = False
+        out = []
+        used = [False] * len(rects)
+        for i in range(len(rects)):
+            if used[i]:
+                continue
+            rx1, ry1, rx2, ry2 = rects[i]
+            used[i] = True
+            changed = True
+            while changed:
+                changed = False
+                for j in range(len(rects)):
+                    if used[j]:
+                        continue
+                    if rect_intersects((rx1, ry1, rx2, ry2), rects[j]):
+                        x1, y1, x2, y2 = rects[j]
+                        rx1 = min(rx1, x1)
+                        ry1 = min(ry1, y1)
+                        rx2 = max(rx2, x2)
+                        ry2 = max(ry2, y2)
+                        used[j] = True
+                        changed = True
+                        merged = True
+            out.append((rx1, ry1, rx2, ry2))
+        rects = out
+    return rects
+
+def tile_rect(r, page_w, page_h, max_pixels=MAX_ROI_PIXELS, overlap=140) -> list[tuple[int, int, int, int]]:
+    x1, y1, x2, y2 = r
+    w = x2 - x1
+    h = y2 - y1
+    if w <= 0 or h <= 0:
+        return []
+    area = w * h
+    if area <= max_pixels:
+        return [clamp_rect(r, page_w, page_h)]
+
+    n = int(np.ceil(np.sqrt(area / max_pixels)))
+    n = max(2, min(n, 7))
+
+    tw = int(np.ceil(w / n))
+    th = int(np.ceil(h / n))
+
+    tiles = []
+    for iy in range(n):
+        for ix in range(n):
+            tx1 = x1 + ix * tw - overlap
+            ty1 = y1 + iy * th - overlap
+            tx2 = x1 + (ix + 1) * tw + overlap
+            ty2 = y1 + (iy + 1) * th + overlap
+            tiles.append(clamp_rect((tx1, ty1, tx2, ty2), page_w, page_h))
+
+    return merge_rects(tiles)
+
+# ---------------------------
+# ROI detection: bearing/distance callouts (tesseract on downscaled binarized page)
+# ---------------------------
+def detect_bearing_distance_rois(page_img: Image.Image, roi_pad: int = 55, max_rois: int = 60, tess_timeout: int | None = None) -> list[tuple[int, int, int, int]]:
+    W, H = page_img.size
+    page_pixels = W * H
+    scale = min(1.0, (MAX_DET_PIXELS / page_pixels) ** 0.5) if page_pixels > 0 else 1.0
+
+    if scale < 1.0:
+        small = page_img.resize((max(1, int(W * scale)), max(1, int(H * scale))), Image.BICUBIC)
+    else:
+        small = page_img
+
+    sW, sH = small.size
+    arr = np.array(small.convert("RGB"))
+    gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
+    gray = cv2.GaussianBlur(gray, (3, 3), 0)
+    det = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                cv2.THRESH_BINARY, 41, 11)
+    det_img = Image.fromarray(det)
+
+    # IMPORTANT: no quotes anywhere in config (prevents shlex "No closing quotation")
+    det_cfg = "--oem 3 --psm 11 -c preserve_interword_spaces=1"
+    lines = ocr_image_to_lines_with_words_tesseract(det_img, det_cfg, timeout=tess_timeout)
+
+    rects = []
+    scored = []
+    pad_s = max(5, int(roi_pad * scale))
+
+    for ln in lines:
+        t = ln["text"]
+        if not t:
+            continue
+
+        looks_like_pair = bool(CANDIDATE_LINE_RE.search(t)) or bool(BEARING_RE.search(t) and re.search(r"\d", t))
+        if not looks_like_pair:
+            continue
+
+        x1, y1, x2, y2 = ln["bbox"]
+        bw = x2 - x1
+        bh = y2 - y1
+
+        if bh > 0.20 * sH:
+            continue
+        if bw > 0.98 * sW and bh > 0.06 * sH:
+            continue
+
+        x1 -= pad_s; y1 -= pad_s; x2 += pad_s; y2 += pad_s
+        x1, y1, x2, y2 = clamp_rect((x1, y1, x2, y2), sW, sH)
+
+        if scale != 1.0:
+            ox1 = int(x1 / scale); oy1 = int(y1 / scale)
+            ox2 = int(x2 / scale); oy2 = int(y2 / scale)
+        else:
+            ox1, oy1, ox2, oy2 = x1, y1, x2, y2
+
+        r = clamp_rect((ox1, oy1, ox2, oy2), W, H)
+        rects.append(r)
+        scored.append((ln["conf"], r))
+
+    if not rects:
+        return []
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    rects = [r for _, r in scored[: max_rois * 3]]
+    rects = merge_rects(rects)
+
+    page_area = W * H
+    def area(r): return (r[2] - r[0]) * (r[3] - r[1])
+    rects = [r for r in rects if area(r) < 0.35 * page_area]
+
+    rects.sort(key=area)
+    return rects[:max_rois]
+
+# ---------------------------
+# ROI detection: table regions
+# ---------------------------
+TABLE_KEYWORDS = {"table", "line", "curve", "bearing", "distance", "chord", "delta", "radius", "length", "arc"}
+
+def detect_table_rois(page_img: Image.Image, max_tables: int = 10, tess_timeout: int | None = None) -> list[tuple[str, tuple[int, int, int, int]]]:
+    W, H = page_img.size
+    page_pixels = W * H
+    scale = min(1.0, (MAX_DET_PIXELS / page_pixels) ** 0.5) if page_pixels > 0 else 1.0
+
+    if scale < 1.0:
+        small = page_img.resize((max(1, int(W * scale)), max(1, int(H * scale))), Image.BICUBIC)
+    else:
+        small = page_img
+
+    sW, sH = small.size
+    arr = np.array(small.convert("RGB"))
+    gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
+    gray = cv2.GaussianBlur(gray, (3, 3), 0)
+    bw = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                               cv2.THRESH_BINARY, 41, 11)
+    pil = Image.fromarray(bw)
+
+    whitelist = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789()°.,-"
+    cfg = f"--oem 3 --psm 6 -c preserve_interword_spaces=1 -c tessedit_char_whitelist={whitelist}"
+    data = pytesseract.image_to_data(pil, config=cfg, lang="eng", output_type=Output.DICT, timeout=tess_timeout)
+
+    hits = []
+    n = len(data.get("text", []))
+    for i in range(n):
+        t = (data["text"][i] or "").strip()
+        if not t:
+            continue
+        try:
+            conf = float(data.get("conf", ["-1"])[i])
+        except Exception:
+            conf = -1.0
+        if conf < 35:
+            continue
+
+        tl = re.sub(r"[^a-z0-9]", "", t.lower())
+        if not tl:
+            continue
+        if tl in TABLE_KEYWORDS:
+            x = int(data["left"][i]); y = int(data["top"][i])
+            w = int(data["width"][i]); h = int(data["height"][i])
+            hits.append((tl, conf, (x, y, x + w, y + h)))
+
+    if not hits:
+        return []
+
+    clusters = []
+    for kw, conf, bb in hits:
+        cx = (bb[0] + bb[2]) / 2.0
+        cy = (bb[1] + bb[3]) / 2.0
+        placed = False
+        for cl in clusters:
+            if abs(cx - cl["cx"]) < 280 and abs(cy - cl["cy"]) < 170:
+                cl["items"].append((kw, conf, bb))
+                cl["cx"] = (cl["cx"] * 0.7 + cx * 0.3)
+                cl["cy"] = (cl["cy"] * 0.7 + cy * 0.3)
+                placed = True
+                break
+        if not placed:
+            clusters.append({"cx": cx, "cy": cy, "items": [(kw, conf, bb)]})
+
+    out = []
+    for cl in clusters:
+        kws = {k for (k, _, _) in cl["items"]}
+        kind = None
+        if "table" in kws and "line" in kws and ("bearing" in kws or "distance" in kws):
+            kind = "line_table"
+        elif "table" in kws and "curve" in kws and ("chord" in kws or "radius" in kws or "delta" in kws):
+            kind = "curve_table"
+        else:
+            if "line" in kws and "bearing" in kws and "distance" in kws:
+                kind = "line_table"
+            elif "curve" in kws and ("chord" in kws or "radius" in kws) and ("distance" in kws or "length" in kws):
+                kind = "curve_table"
+        if not kind:
+            continue
+
+        xs = [bb[0] for (_, _, bb) in cl["items"]]
+        ys = [bb[1] for (_, _, bb) in cl["items"]]
+        xe = [bb[2] for (_, _, bb) in cl["items"]]
+        ye = [bb[3] for (_, _, bb) in cl["items"]]
+        x1 = min(xs); y1 = min(ys); x2 = max(xe); y2 = max(ye)
+
+        header_h = max(12, y2 - y1)
+        pad_x = int(0.18 * sW)
+        pad_y = int(0.05 * sH)
+
+        x1 = max(0, x1 - pad_x)
+        x2 = min(sW, x2 + pad_x)
+        y1 = max(0, y1 - pad_y)
+        y2 = min(sH, y2 + max(int(0.40 * sH), 18 * header_h))
+
+        if scale != 1.0:
+            ox1 = int(x1 / scale); oy1 = int(y1 / scale)
+            ox2 = int(x2 / scale); oy2 = int(y2 / scale)
+        else:
+            ox1, oy1, ox2, oy2 = x1, y1, x2, y2
+
+        r = clamp_rect((ox1, oy1, ox2, oy2), W, H)
+        out.append((kind, r))
+
+    if not out:
+        return []
+
+    by_kind = defaultdict(list)
+    for k, r in out:
+        by_kind[k].append(r)
+
+    merged = []
+    for k, rects in by_kind.items():
+        rects = merge_rects(rects)
+        for r in rects:
+            merged.append((k, r))
+
+    merged.sort(key=lambda kr: (kr[1][3] - kr[1][1]) * (kr[1][2] - kr[1][0]), reverse=True)
+    return merged[:max_tables]
+
+# ---------------------------
+# Clutter filters
+# ---------------------------
+def is_metadata_line(line_text: str) -> bool:
+    t = (line_text or "").strip().lower()
+    if not t:
+        return False
+    if DATE_RE.search(t):
+        return True
+    has_year = bool(YEAR_RE.search(t))
+    has_month = any(m in t for m in MONTHS)
+    if not (has_year or has_month):
+        return False
+    for kw in METADATA_KEYWORDS:
+        if kw in t:
+            return True
+    return False
+
+def has_area_unit_near(words: list[dict], idx: int, window: int = 4) -> bool:
+    start = max(0, idx - window)
+    end = min(len(words), idx + window + 1)
+    snippet = " ".join((words[i]["text"] or "") for i in range(start, end))
+    return bool(AREA_UNITS_RE.search(snippet))
+
+# ---------------------------
+# Record distance parsing: (124) after measured distance
+# ---------------------------
+PAREN_RE = re.compile(r"\(([^)]+)\)")
+
+def parse_record_distance_from_following(words: list[dict], dist_idx: int, dot_ref_img: Image.Image | None) -> tuple[float | None, str | None, str | None]:
+    join = ""
+    bbox_for_dot = None
+
+    for j in range(dist_idx, min(len(words), dist_idx + 6)):
+        tok = (words[j]["text"] or "")
+        join += tok
+
+        m = PAREN_RE.search(join)
+        if not m:
+            continue
+
+        inside = (m.group(1) or "").strip()
+        inside2 = re.sub(r"[^0-9.,·•∙⋅]", "", inside)
+        if not inside2:
+            return None, None, None
+
+        tokj = (words[j]["text"] or "")
+        if "(" in tokj and ")" in tokj:
+            bbox_for_dot = words[j]["bbox"]
+
+        dot_digits_right = None
+        if dot_ref_img is not None and bbox_for_dot is not None:
+            dot_digits_right = detect_decimal_dot_digits_right(dot_ref_img, bbox_for_dot)
+
+        v, q = parse_distance_with_quality(inside2, dot_digits_right=dot_digits_right, min_ft=0.0, max_ft=50_000_000.0)
+        if v is None:
+            return None, None, None
+
+        if abs(v - round(v)) < 1e-9:
+            s = f"{int(round(v))}"
+        else:
+            s = f"{v:.2f}".rstrip("0").rstrip(".")
+        return float(v), s, q
+
+    return None, None, None
+
+# ---------------------------
+# Extract label L#/C# from line words
+# ---------------------------
+def find_label_in_words(words: list[dict]) -> str | None:
+    for w in words:
+        t = (w.get("text") or "").strip()
+        if not t:
+            continue
+        m = LINE_ID_RE.search(t)
+        if m:
+            c = canon_label(m.group(0))
+            if c:
+                return c
+        m = CURVE_ID_RE.search(t)
+        if m:
+            c = canon_label(m.group(0))
+            if c:
+                return c
+    joined = " ".join((w.get("text") or "") for w in words)
+    m = LINE_ID_RE.search(joined)
+    if m:
+        c = canon_label(m.group(0))
+        if c:
+            return c
+    m = CURVE_ID_RE.search(joined)
+    if m:
+        c = canon_label(m.group(0))
+        if c:
+            return c
+    return None
+
+# ---------------------------
+# Extract pairs from a tesseract line using word bboxes + overlap + clutter rules
+# ---------------------------
+def extract_pairs_from_line_words(
+    line_text: str,
+    line_words: list[dict],
+    dot_ref_img: Image.Image | None,
+    line_mask: np.ndarray | None,
+    min_ft: float = 1.0,
+    require_label: bool = False,
+) -> list[dict]:
+    out = []
+    if not line_words:
+        return out
+
+    if is_metadata_line(line_text):
+        return out
+
+    ref_id = find_label_in_words(line_words)
+    if require_label and not ref_id:
+        return out
+
+    texts = [w["text"] for w in line_words]
+
+    for i in range(len(texts)):
+        for win in (3, 4, 5, 6, 7):
+            j = min(len(texts), i + win)
+            snippet = " ".join(texts[i:j])
+            bm = BEARING_RE.search(snippet)
+            if not bm:
+                continue
+
+            b_raw = bm.group(0)
+            b_canon = parse_bearing_to_canon(b_raw)
+            if not b_canon:
+                continue
+
+            # find the next plausible distance token
+            dist_idx = None
+            for k in range(j, min(len(texts), j + 14)):
+                tok = (texts[k] or "").strip()
+                if not tok:
+                    continue
+                if re.search(r"[A-Za-z]", tok):
+                    continue
+
+                # allow "(124)" etc but we want measured token first
+                if "(" in tok or ")" in tok:
+                    if "(" in tok and re.search(r"^\(?\d", tok):
+                        if any(ch in tok for ch in (".", "·", "•", "∙", "⋅")):
+                            dist_idx = k
+                            break
+                    continue
+
+                if DIST_TOKEN_RE.match(tok) or re.search(r"\d", tok):
+                    dist_idx = k
+                    break
+
+            if dist_idx is None:
+                continue
+
+            meas_raw = texts[dist_idx]
+            meas_bbox = line_words[dist_idx]["bbox"]
+
+            # reject acreage/area contexts
+            if has_area_unit_near(line_words, dist_idx, window=5):
+                break
+
+            overlap = 0.0
+            if line_mask is not None and meas_bbox is not None:
+                overlap = mask_overlap_ratio(line_mask, meas_bbox)
+                if overlap >= LINE_OVERLAP_HARD_REJECT:
+                    break
+
+            dot_digits_right = None
+            if dot_ref_img is not None:
+                dot_digits_right = detect_decimal_dot_digits_right(dot_ref_img, meas_bbox)
+
+            meas_val, meas_quality = parse_distance_with_quality(meas_raw, dot_digits_right=dot_digits_right, min_ft=min_ft)
+            if meas_val is None:
+                break
+
+            rec_val, rec_str, rec_quality = parse_record_distance_from_following(line_words, dist_idx, dot_ref_img)
+
+            meas_str = f"{meas_val:.3f}".rstrip("0").rstrip(".") if meas_quality == "dot_blob" else f"{meas_val:.2f}"
+
+            out.append({
+                "canon_bearing": b_canon,
+                "numeric_dist": float(meas_val),
+                "distance": meas_str,
+                "dist_quality": meas_quality,
+                "dist_raw": meas_raw,
+                "dist_bbox": meas_bbox,
+                "line_overlap": float(overlap),
+
+                "record_numeric_dist": float(rec_val) if rec_val is not None else None,
+                "record_distance": rec_str,
+                "record_quality": rec_quality,
+
+                "ref_id": ref_id,
+                "basis_hint": bool(BASIS_CUE_RE.search(line_text or "")),
+            })
+            break
+
+    return out
+
+# ---------------------------
+# Parse pairs from a simple text line (Paddle/DocTR lines lack word boxes)
+# ---------------------------
+def extract_pairs_from_textline_simple(line_text: str, require_label: bool = False) -> list[dict]:
+    """
+    Lower-fidelity parser used for Paddle/DocTR lines:
+      - no per-word dot evidence
+      - weaker record-distance extraction
+      - still useful for recall on skewed/rotated annotations
+    """
+    out = []
+    if not line_text:
+        return out
+    if is_metadata_line(line_text):
+        return out
+
+    # optional label requirement for tables
+    ref_id = None
+    m = LINE_ID_RE.search(line_text) or CURVE_ID_RE.search(line_text)
+    if m:
+        ref_id = canon_label(m.group(0))
+    if require_label and not ref_id:
+        return out
+
+    # find bearing
+    bm = BEARING_RE.search(line_text)
+    if not bm:
+        return out
+
+    b_canon = parse_bearing_to_canon(bm.group(0))
+    if not b_canon:
+        return out
+
+    # find distance after bearing
+    tail = line_text[bm.end():]
+    # capture something like 123.45 or 12345 or 123.45(124)
+    dm = re.search(r"([0-9][0-9,]{0,12}(?:[.·•∙⋅][0-9]{1,4})?)", tail)
+    if not dm:
+        return out
+
+    d_raw = dm.group(1)
+    meas_val, meas_q = parse_distance_with_quality(d_raw, dot_digits_right=None, min_ft=1.0)
+    if meas_val is None:
+        return out
+
+    # record distance: (124) later in tail
+    rec_val = None
+    rec_str = None
+    rec_q = None
+    pm = re.search(r"\(([^)]+)\)", tail)
+    if pm:
+        inside2 = re.sub(r"[^0-9.,·•∙⋅]", "", pm.group(1) or "")
+        if inside2:
+            rv, rq = parse_distance_with_quality(inside2, dot_digits_right=None, min_ft=0.0)
+            if rv is not None:
+                rec_val = float(rv)
+                rec_q = rq
+                rec_str = f"{int(rv)}" if abs(rv - round(rv)) < 1e-9 else f"{rv:.2f}".rstrip("0").rstrip(".")
+
+    out.append({
+        "canon_bearing": b_canon,
+        "numeric_dist": float(meas_val),
+        "distance": f"{meas_val:.2f}",
+        "dist_quality": meas_q,
+        "dist_raw": d_raw,
+        "dist_bbox": None,
+        "line_overlap": 0.0,
+
+        "record_numeric_dist": rec_val,
+        "record_distance": rec_str,
+        "record_quality": rec_q,
+
+        "ref_id": ref_id,
+        "basis_hint": bool(BASIS_CUE_RE.search(line_text or "")),
+    })
+    return out
+
+# ---------------------------
+# Multipass OCR on ROI (multi-engine)
+# ---------------------------
+def multipass_ocr_on_roi(
+    roi_img: Image.Image,
+    ocr_configs: list[tuple[str, str]],
+    table_configs: list[tuple[str, str]],
+    variants: list[dict],
+    require_label: bool,
+    tess_timeout: int | None,
+    engines: dict,
+) -> list[dict]:
+    """
+    Returns list of candidate dicts from:
+      - Tesseract (full word boxes + dot evidence + overlap penalties)
+      - optional PaddleOCR (simple parsing)
+      - optional DocTR (simple parsing)
+    """
+    candidates = []
+
+    # --- Tesseract passes (highest-fidelity for decimal dots / overlap)
+    for v in variants:
+        proc, aux = preprocess_variant(roi_img, v)
+        dot_ref_img = proc if aux.get("dot_ref", False) else None
+        line_mask = aux.get("line_mask", None)
+
+        for cfg, desc in ocr_configs:
+            lines = ocr_image_to_lines_with_words_tesseract(proc, cfg, timeout=tess_timeout)
+            for ln in lines:
+                for c in extract_pairs_from_line_words(
+                    line_text=ln["text"],
+                    line_words=ln["words"],
+                    dot_ref_img=dot_ref_img,
+                    line_mask=line_mask,
+                    min_ft=1.0,
+                    require_label=require_label,
+                ):
+                    theta = bearing_theta_deg(c["canon_bearing"])
+                    candidates.append({
+                        "canon_bearing": c["canon_bearing"],
+                        "distance": c["distance"],
+                        "numeric_dist": c["numeric_dist"],
+                        "theta": theta,
+                        "conf": float(ln["conf"]) if ln["conf"] is not None else -1.0,
+
+                        "engine": "tesseract",
+                        "pass_name": v["name"],
+                        "config_desc": desc,
+                        "raw_line": ln["text"],
+
+                        "dist_quality": c.get("dist_quality"),
+                        "dist_raw": c.get("dist_raw"),
+                        "dist_bbox": c.get("dist_bbox"),
+                        "line_overlap": float(c.get("line_overlap", 0.0)),
+                        "line_clean": bool(v.get("line_clean", False)),
+
+                        "record_numeric_dist": c.get("record_numeric_dist"),
+                        "record_distance": c.get("record_distance"),
+                        "record_quality": c.get("record_quality"),
+
+                        "ref_id": c.get("ref_id"),
+                        "basis_hint": bool(c.get("basis_hint", False)),
+                    })
+
+    # --- PaddleOCR (optional)
+    paddle = engines.get("paddle")
+    if paddle is not None:
+        try:
+            out = paddle.ocr_image(roi_img, timeout=tess_timeout)
+            lines = out[0] if out else []
+            for quad, (text, score) in lines:
+                text = (text or "").strip()
+                if not text:
+                    continue
+                for c in extract_pairs_from_textline_simple(text, require_label=require_label):
+                    candidates.append({
+                        "canon_bearing": c["canon_bearing"],
+                        "distance": c["distance"],
+                        "numeric_dist": c["numeric_dist"],
+                        "theta": bearing_theta_deg(c["canon_bearing"]),
+                        "conf": float(score) * 100.0,
+
+                        "engine": "paddle",
+                        "pass_name": "paddle",
+                        "config_desc": "paddle",
+                        "raw_line": text,
+
+                        "dist_quality": c.get("dist_quality"),
+                        "dist_raw": c.get("dist_raw"),
+                        "dist_bbox": None,
+                        "line_overlap": 0.0,
+                        "line_clean": False,
+
+                        "record_numeric_dist": c.get("record_numeric_dist"),
+                        "record_distance": c.get("record_distance"),
+                        "record_quality": c.get("record_quality"),
+
+                        "ref_id": c.get("ref_id"),
+                        "basis_hint": bool(c.get("basis_hint", False)),
+                    })
+        except Exception:
+            pass
+
+    # --- DocTR (optional)
+    doctr = engines.get("doctr")
+    if doctr is not None:
+        try:
+            out = doctr.ocr_image(roi_img)
+            lines = out[0] if out else []
+            for quad, (text, score) in lines:
+                text = (text or "").strip()
+                if not text:
+                    continue
+                for c in extract_pairs_from_textline_simple(text, require_label=require_label):
+                    candidates.append({
+                        "canon_bearing": c["canon_bearing"],
+                        "distance": c["distance"],
+                        "numeric_dist": c["numeric_dist"],
+                        "theta": bearing_theta_deg(c["canon_bearing"]),
+                        "conf": float(score) * 100.0,
+
+                        "engine": "doctr",
+                        "pass_name": "doctr",
+                        "config_desc": "doctr",
+                        "raw_line": text,
+
+                        "dist_quality": c.get("dist_quality"),
+                        "dist_raw": c.get("dist_raw"),
+                        "dist_bbox": None,
+                        "line_overlap": 0.0,
+                        "line_clean": False,
+
+                        "record_numeric_dist": c.get("record_numeric_dist"),
+                        "record_distance": c.get("record_distance"),
+                        "record_quality": c.get("record_quality"),
+
+                        "ref_id": c.get("ref_id"),
+                        "basis_hint": bool(c.get("basis_hint", False)),
+                    })
+        except Exception:
+            pass
+
+    return candidates
+
+# ---------------------------
+# Candidate clustering / voting
+# ---------------------------
+def similar_measurement(a: dict, b: dict, dist_tol: float, bear_tol_deg: float) -> bool:
+    qa = a["canon_bearing"].split()[0] + a["canon_bearing"].split()[-1]
+    qb = b["canon_bearing"].split()[0] + b["canon_bearing"].split()[-1]
+    if qa != qb:
+        return False
+    if abs(a["numeric_dist"] - b["numeric_dist"]) > dist_tol:
+        return False
+    ta = a.get("theta")
+    tb = b.get("theta")
+    if ta is None or tb is None:
+        return False
+    dtheta = abs(ta - tb)
+    dtheta = min(dtheta, 360.0 - dtheta)
+    return dtheta <= bear_tol_deg
+
+def cluster_candidates(cands: list[dict], dist_tol: float, bear_tol_deg: float) -> list[list[dict]]:
+    clusters: list[list[dict]] = []
+    for c in cands:
+        placed = False
+        for cl in clusters:
+            if similar_measurement(c, cl[0], dist_tol, bear_tol_deg):
+                cl.append(c)
+                placed = True
+                break
+        if not placed:
+            clusters.append([c])
+    return clusters
+
+def _decimal_evidence_bonus(q: str) -> float:
+    if q == "explicit_decimal":
+        return 2.2
+    if q == "comma_decimal":
+        return 1.6
+    if q == "dot_blob":
+        return 1.3
+    if q == "integer":
+        return 0.0
+    return 0.0
+
+def pick_cluster_winner(cluster: list[dict]) -> dict:
+    key_counts = Counter((c["canon_bearing"], c["distance"]) for c in cluster)
+    top_count = max(key_counts.values())
+    top_keys = [k for k, v in key_counts.items() if v == top_count]
+
+    def score_key(k):
+        reps = [c for c in cluster if (c["canon_bearing"], c["distance"]) == k]
+        confs = [c["conf"] for c in reps if c["conf"] >= 0]
+        mean_conf = sum(confs) / len(confs) if confs else -1.0
+
+        dec_bonus = sum(_decimal_evidence_bonus(c.get("dist_quality", "")) for c in reps) / max(1, len(reps))
+        overlap_avg = sum(float(c.get("line_overlap", 0.0)) for c in reps) / max(1, len(reps))
+        score = mean_conf + dec_bonus - (LINE_OVERLAP_PENALTY_WT * overlap_avg)
+
+        dpis = {c.get("dpi") for c in reps}
+        angs = {c.get("angle") for c in reps}
+        engines = {c.get("engine") for c in reps}
+        if len(dpis) >= 2:
+            score += 0.6
+        if len(angs) >= 3:
+            score += 0.5
+        if len(engines) >= 2:
+            score += 0.5
+
+        # basis hint bonus if many reps had basis cue
+        bh = sum(1 for c in reps if c.get("basis_hint"))
+        if bh >= 2:
+            score += 0.8
+
+        return score, mean_conf, dec_bonus, overlap_avg, reps
+
+    best_key = None
+    best_tuple = (-1e18, -1e18, -1e18, 1e18, [])
+    for k in top_keys:
+        sc, mc, db, ov, reps = score_key(k)
+        if (sc, mc, db, -ov) > (best_tuple[0], best_tuple[1], best_tuple[2], -best_tuple[3]):
+            best_tuple = (sc, mc, db, ov, reps)
+            best_key = k
+
+    score, mean_conf, dec_bonus, overlap_avg, reps = best_tuple
+    reps.sort(key=lambda x: x["conf"], reverse=True)
+    rep = reps[0]
+
+    bearing, dist_str = best_key
+    dist_val = float(dist_str)
+
+    # record distance voting
+    rec_counts = Counter((c.get("record_distance") or None) for c in reps)
+    rec_choice = None
+    if rec_counts:
+        non_none = [(k, v) for k, v in rec_counts.items() if k is not None]
+        if non_none:
+            non_none.sort(key=lambda kv: kv[1], reverse=True)
+            rec_choice = non_none[0][0]
+
+    rec_num = None
+    if rec_choice is not None:
+        for c in reps:
+            if c.get("record_distance") == rec_choice and c.get("record_numeric_dist") is not None:
+                rec_num = float(c["record_numeric_dist"])
+                break
+
+    dq = Counter(c.get("dist_quality", "unknown") for c in reps)
+    rq = Counter(c.get("record_quality", "none") for c in reps if c.get("record_distance") is not None)
+    passes = Counter((c.get("engine"), c.get("pass_name"), c.get("config_desc")) for c in reps)
+    angles = Counter(c.get("angle", 0) for c in reps)
+    dpis = Counter(c.get("dpi", 0) for c in reps)
+    linec = Counter("lineclean" if c.get("line_clean") else "raw" for c in reps)
+
+    basis_votes = sum(1 for c in reps if c.get("basis_hint"))
+
+    return {
+        "bearing": bearing,
+        "distance": dist_str,
+        "numeric_dist": dist_val,
+
+        "record_distance": rec_choice,
+        "record_numeric_dist": rec_num,
+
+        "ref_id": rep.get("ref_id"),
+        "table_kind": rep.get("table_kind"),
+
+        "support": top_count,
+        "best_conf": mean_conf,
+        "vote_score": float(score),
+        "avg_line_overlap": float(overlap_avg),
+
+        "basis_votes": int(basis_votes),
+
+        "dist_quality_votes": [{"quality": q, "count": n} for q, n in dq.most_common(8)],
+        "record_quality_votes": [{"quality": q, "count": n} for q, n in rq.most_common(8)] if rq else [],
+        "line_mode_votes": [{"mode": m, "count": n} for m, n in linec.most_common(4)],
+        "example_raw": rep.get("raw_line", ""),
+        "source": rep.get("source", "voted_roi"),
+        "angle_votes": [{"angle": a, "count": n} for a, n in angles.most_common(8)],
+        "dpi_votes": [{"dpi": d, "count": n} for d, n in dpis.most_common(8)],
+        "pass_breakdown": [{"engine": e, "pass": p, "config": cfg, "count": n} for (e, p, cfg), n in passes.most_common(12)],
+    }
+
+# ---------------------------
+# Callout scanning (L# / C# occurrences detected) — tesseract
+# ---------------------------
+def scan_label_callouts(page_img: Image.Image, angles: list[float], tess_timeout: int | None) -> dict[str, int]:
+    counts = defaultdict(set)
+
+    whitelist = "LC0123456789lc-"
+    cfg = f"--oem 3 --psm 11 -c preserve_interword_spaces=1 -c tessedit_char_whitelist={whitelist}"
+    for a in angles:
+        rot = rotate_keep_size(page_img, a)
+        W, H = rot.size
+
+        scale = min(1.0, (MAX_DET_PIXELS / (W * H)) ** 0.5) if W * H > 0 else 1.0
+        if scale < 1.0:
+            small = rot.resize((max(1, int(W * scale)), max(1, int(H * scale))), Image.BICUBIC)
+        else:
+            small = rot
+
+        data = pytesseract.image_to_data(small, config=cfg, lang="eng", output_type=Output.DICT, timeout=tess_timeout)
+        n = len(data.get("text", []))
+        for i in range(n):
+            t = (data["text"][i] or "").strip()
+            if not t:
+                continue
+            try:
+                conf = float(data.get("conf", ["-1"])[i])
+            except Exception:
+                conf = -1.0
+            if conf < 40:
+                continue
+
+            m = LINE_ID_RE.search(t) or CURVE_ID_RE.search(t)
+            if not m:
+                continue
+            lab = canon_label(m.group(0))
+            if not lab:
+                continue
+
+            x = int(data["left"][i]); y = int(data["top"][i])
+            w = int(data["width"][i]); h = int(data["height"][i])
+            bx = int(x / 20); by = int(y / 20)
+            counts[lab].add((a, bx, by, int(w / 10), int(h / 10)))
+
+    return {lab: len(s) for lab, s in counts.items()}
+
+# ---------------------------
+# Basis of Bearing detection (restored)
+# ---------------------------
+def detect_basis_candidates_on_page(page_img: Image.Image, angles: list[float], tess_timeout: int | None) -> list[dict]:
+    """
+    Lightweight pass across a few angles to find 'BASIS OF BEARING' lines and extract the nearby bearing/distance.
+    Returns list of candidate dicts (same schema as normal candidates but marked basis_candidate=True).
+    """
+    cands = []
+    cfg = "--oem 3 --psm 11 -c preserve_interword_spaces=1"
+
+    for a in angles:
+        rot = rotate_keep_size(page_img, a)
+        W, H = rot.size
+
+        # downscale for speed
+        scale = min(1.0, (MAX_DET_PIXELS / (W * H)) ** 0.5) if W * H > 0 else 1.0
+        if scale < 1.0:
+            small = rot.resize((max(1, int(W * scale)), max(1, int(H * scale))), Image.BICUBIC)
+        else:
+            small = rot
+
+        # binarize for better keyword OCR
+        arr = np.array(small.convert("RGB"))
+        gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
+        gray = cv2.GaussianBlur(gray, (3, 3), 0)
+        bw = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 41, 11)
+        pil = Image.fromarray(bw)
+
+        lines = ocr_image_to_lines_with_words_tesseract(pil, cfg, timeout=tess_timeout)
+        for ln in lines:
+            t = (ln["text"] or "").strip()
+            if not t:
+                continue
+            if not BASIS_CUE_RE.search(t):
+                continue
+
+            # search within this line for bearing/distance; else look at next few lines is expensive; keep local
+            bm = BEARING_RE.search(t)
+            if not bm:
+                continue
+            b = parse_bearing_to_canon(bm.group(0))
+            if not b:
+                continue
+            tail = t[bm.end():]
+            dm = re.search(r"([0-9][0-9,]{0,12}(?:[.·•∙⋅][0-9]{1,4})?)", tail)
+            if not dm:
+                continue
+            d_raw = dm.group(1)
+            dv, dq = parse_distance_with_quality(d_raw, dot_digits_right=None, min_ft=1.0)
+            if dv is None:
+                continue
+
+            cands.append({
+                "canon_bearing": b,
+                "distance": f"{dv:.2f}",
+                "numeric_dist": float(dv),
+                "theta": bearing_theta_deg(b),
+                "conf": float(ln["conf"]) if ln["conf"] is not None else -1.0,
+                "engine": "tesseract",
+                "pass_name": "basis_scan",
+                "config_desc": "basis_scan",
+                "raw_line": t,
+                "dist_quality": dq,
+                "dist_raw": d_raw,
+                "dist_bbox": None,
+                "line_overlap": 0.0,
+                "line_clean": False,
+                "record_numeric_dist": None,
+                "record_distance": None,
+                "record_quality": None,
+                "ref_id": None,
+                "basis_hint": True,
+                "basis_candidate": True,
+                "angle": float(a),
+            })
+
+    return cands
+
+# ---------------------------
+# Quality profiles
+# ---------------------------
+def parse_float_list(s: str) -> list[float]:
+    out = []
+    for p in (s or "").split(","):
+        p = p.strip()
+        if not p:
+            continue
+        try:
+            out.append(float(p))
+        except ValueError:
+            pass
+    return out
+
+def angles_dense_360(step: float) -> list[float]:
+    step = float(step)
+    if step <= 0:
+        step = 5.0
+    n = int(round(360.0 / step))
+    out = [round(i * step, 6) for i in range(n)]
+    if 0.0 not in out:
+        out.append(0.0)
+    return out
+
+def quality_profile(name: str) -> dict:
+    q = (name or "max").strip().lower()
+
+    if q == "fast":
+        return {
+            "dpi_list": [450],
+            "angles": [0.0, 90.0, 180.0, 270.0],
+            "fallback_tile_angles": {0.0, 90.0, 180.0, 270.0},
+            "callout_angles": [0.0, 90.0, 180.0, 270.0],
+            "basis_angles": [0.0, 90.0, 180.0, 270.0],
+            "min_support": 1,
+            "dist_tol": 0.35,
+            "bear_tol_deg": 0.5,
+            "max_rois": 30,
+            "roi_pad": 55,
+        }
+
+    if q == "balanced":
+        return {
+            "dpi_list": [500],
+            "angles": angles_dense_360(10.0),
+            "fallback_tile_angles": set(angles_dense_360(30.0)),
+            "callout_angles": [0.0, 90.0, 180.0, 270.0],
+            "basis_angles": [0.0, 90.0, 180.0, 270.0],
+            "min_support": 2,
+            "dist_tol": 0.25,
+            "bear_tol_deg": 0.40,
+            "max_rois": 40,
+            "roi_pad": 55,
+        }
+
+    # max / exhaustive
+    return {
+        "dpi_list": [500, 650, 800],
+        "angles": angles_dense_360(5.0),
+        "fallback_tile_angles": set(angles_dense_360(15.0)),
+        "callout_angles": angles_dense_360(30.0),
+        "basis_angles": [0.0, 90.0, 180.0, 270.0],
+        "min_support": 3,
+        "dist_tol": 0.20,
+        "bear_tol_deg": 0.35,
+        "max_rois": 70,
+        "roi_pad": 60,
+    }
+
+# ---------------------------
+# Per-angle worker
+# ---------------------------
+def _process_one_angle(
+    page_img: Image.Image,
+    page_idx: int,
+    dpi: int,
+    angle: float,
+    fallback_tile_angles: set[float],
+    roi_pad: int,
+    max_rois: int,
+    enable_tables: bool,
+    debug_dir: Path | None,
+    ocr_configs: list[tuple[str, str]],
+    table_configs: list[tuple[str, str]],
+    variants: list[dict],
+    tess_timeout: int | None,
+    engines: dict,
+) -> tuple[list[dict], list[dict]]:
+    rot_img = rotate_keep_size(page_img, angle)
+    W, H = rot_img.size
+
+    rois = detect_bearing_distance_rois(rot_img, roi_pad=int(roi_pad), max_rois=int(max_rois), tess_timeout=tess_timeout)
+    tiled_mode = False
+    if not rois:
+        if float(angle) in fallback_tile_angles:
+            tiled_mode = True
+            rois = tile_rect((0, 0, W, H), W, H, max_pixels=MAX_ROI_PIXELS, overlap=170)
+        else:
+            rois = []
+
+    roi_candidates: list[dict] = []
+    table_candidates: list[dict] = []
+
+    roi_counter = 0
+    for r in rois:
+        tiles = tile_rect(r, W, H, max_pixels=MAX_ROI_PIXELS, overlap=160)
+        for tr in tiles:
+            roi_counter += 1
+            x1, y1, x2, y2 = tr
+            crop = rot_img.crop((x1, y1, x2, y2))
+
+            if debug_dir:
+                crop_path = debug_dir / f"p{page_idx:02d}_dpi{dpi}_a{int(angle):03d}_roi{roi_counter:04d}_{x1}_{y1}_{x2}_{y2}.png"
+                try:
+                    crop.save(crop_path)
+                except Exception:
+                    pass
+
+            cands = multipass_ocr_on_roi(
+                crop,
+                ocr_configs=ocr_configs,
+                table_configs=table_configs,
+                variants=variants,
+                require_label=False,
+                tess_timeout=tess_timeout,
+                engines=engines,
+            )
+
+            for c in cands:
+                c["page"] = page_idx
+                c["dpi"] = int(dpi)
+                c["angle"] = float(angle)
+                c["roi"] = roi_counter
+                c["roi_bbox"] = (x1, y1, x2, y2)
+                c["table_kind"] = None
+                c["source"] = "roi"
+
+                if tiled_mode:
+                    roi_cy = (y1 + y2) / 2.0
+                    c["_rej_hf"] = bool(roi_cy <= HEADER_FOOTER_STRIP_FRAC * H or roi_cy >= (1.0 - HEADER_FOOTER_STRIP_FRAC) * H)
+                else:
+                    c["_rej_hf"] = False
+
+            cands = [c for c in cands if not c.get("_rej_hf")]
+            roi_candidates.extend(cands)
+
+    if enable_tables:
+        table_rois = detect_table_rois(rot_img, max_tables=10, tess_timeout=tess_timeout)
+        for tkind, tr in table_rois:
+            tx1, ty1, tx2, ty2 = tr
+            tcrop = rot_img.crop((tx1, ty1, tx2, ty2))
+
+            cands = multipass_ocr_on_roi(
+                tcrop,
+                ocr_configs=table_configs,
+                table_configs=table_configs,
+                variants=variants,
+                require_label=True,
+                tess_timeout=tess_timeout,
+                engines=engines,
+            )
+
+            for c in cands:
+                rid = c.get("ref_id")
+                if not rid:
+                    continue
+                if tkind == "line_table" and not rid.startswith("L"):
+                    continue
+                if tkind == "curve_table" and not rid.startswith("C"):
+                    continue
+
+                raw = (c.get("raw_line") or "")
+                c["curve_hint"] = bool(CURVE_HINT_RE.search(raw))
+
+                c["page"] = page_idx
+                c["dpi"] = int(dpi)
+                c["angle"] = float(angle)
+                c["roi"] = "table"
+                c["roi_bbox"] = (tx1, ty1, tx2, ty2)
+                c["table_kind"] = tkind
+                c["source"] = "table_roi"
+
+                table_candidates.append(c)
+
+    return roi_candidates, table_candidates
+
+# ---------------------------
+# Extraction: PDF
+# ---------------------------
+def extract_pairs_from_pdf(
+    pdf_path: Path,
+    quality: str,
+    dpi_list: list[int] | None,
+    angles: list[float] | None,
+    fallback_tile_angles: set[float] | None,
+    callout_angles: list[float] | None,
+    basis_angles: list[float] | None,
+    roi_pad: int | None,
+    max_rois: int | None,
+    dist_tol: float | None,
+    bear_tol_deg: float | None,
+    min_support: int | None,
+    enable_lineclean: bool,
+    enable_tables: bool,
+    debug_dir: Path | None,
+    tess_timeout: int | None,
+    threads: int,
+    engines: dict,
+) -> tuple[list[dict], dict[str, int], dict | None]:
+
+    prof = quality_profile(quality)
+
+    dpi_list = dpi_list if dpi_list else prof["dpi_list"]
+    angles = angles if angles else prof["angles"]
+    fallback_tile_angles = fallback_tile_angles if fallback_tile_angles else prof["fallback_tile_angles"]
+    callout_angles = callout_angles if callout_angles else prof["callout_angles"]
+    basis_angles = basis_angles if basis_angles else prof["basis_angles"]
+    roi_pad = roi_pad if roi_pad is not None else prof["roi_pad"]
+    max_rois = max_rois if max_rois is not None else prof["max_rois"]
+    dist_tol = dist_tol if dist_tol is not None else prof["dist_tol"]
+    bear_tol_deg = bear_tol_deg if bear_tol_deg is not None else prof["bear_tol_deg"]
+    min_support = min_support if min_support is not None else prof["min_support"]
+
+    if debug_dir:
+        debug_dir.mkdir(parents=True, exist_ok=True)
+
+    # IMPORTANT: no quotes in whitelist; avoid shlex failures
+    whitelist = "0123456789NSEWnsewLC.,-()°oº"
+    common = (
+        f"-c preserve_interword_spaces=1 "
+        f"-c classify_bln_numeric_mode=1 "
+        f"-c tessedit_enable_dict_correction=0 "
+        f"-c load_system_dawg=0 -c load_freq_dawg=0 "
+        f"-c user_defined_dpi=600 "
+        f"-c tessedit_char_whitelist={whitelist}"
+    )
+
+    ocr_configs = [
+        (f"--oem 3 --psm 6  {common}", "block"),
+        (f"--oem 3 --psm 11 {common}", "sparse"),
+        (f"--oem 3 --psm 7  {common}", "single_line"),
+        (f"--oem 3 --psm 13 {common}", "raw_line"),
+        (f"--oem 1 --psm 11 {common}", "legacy_sparse"),
+        (f"--oem 1 --psm 6  {common}", "legacy_block"),
+    ]
+
+    table_configs = [
+        (f"--oem 3 --psm 6  {common}", "table_block"),
+        (f"--oem 3 --psm 4  {common}", "table_columns"),
+        (f"--oem 3 --psm 11 {common}", "table_sparse"),
+        (f"--oem 1 --psm 6  {common}", "table_legacy"),
+    ]
+
+    variants = [
+        {"name": "gray",   "thresh": "none", "inv": False, "scale": 1.0, "blur": 0, "denoise": False, "morph_close": False, "dot_ref": True,  "line_clean": False, "line_mask": True},
+        {"name": "gray2x", "thresh": "none", "inv": False, "scale": 2.0, "blur": 0, "denoise": False, "morph_close": False, "dot_ref": True,  "line_clean": False, "line_mask": True},
+        {"name": "clahe2x","thresh": "none", "inv": False, "scale": 2.0, "blur": 0, "denoise": False, "morph_close": False, "dot_ref": True,  "line_clean": False, "line_mask": True,
+         "clahe": True, "clahe_clip": 2.2, "clahe_grid": 8},
+
+        {"name": "otsu2x", "thresh": "otsu", "inv": False, "scale": 2.0, "blur": 3, "denoise": False, "morph_close": True, "dot_ref": False, "line_clean": False, "line_mask": True},
+        {"name": "otsu2x_inv","thresh": "otsu", "inv": True, "scale": 2.0, "blur": 3, "denoise": False, "morph_close": True, "dot_ref": False, "line_clean": False, "line_mask": True},
+
+        {"name": "ag2x_b31_c10","thresh": "adaptive_gauss","inv": False, "scale": 2.0, "blur": 3, "denoise": True, "morph_close": True, "dot_ref": False, "line_clean": False, "line_mask": True, "block_size": 31, "C": 10},
+        {"name": "ag2x_b41_c10","thresh": "adaptive_gauss","inv": False, "scale": 2.0, "blur": 3, "denoise": True, "morph_close": True, "dot_ref": False, "line_clean": False, "line_mask": True, "block_size": 41, "C": 10},
+        {"name": "ag2x_b51_c12","thresh": "adaptive_gauss","inv": False, "scale": 2.0, "blur": 3, "denoise": True, "morph_close": True, "dot_ref": False, "line_clean": False, "line_mask": True, "block_size": 51, "C": 12},
+        {"name": "am2x_b41_c10","thresh": "adaptive_mean", "inv": False, "scale": 2.0, "blur": 3, "denoise": True, "morph_close": True, "dot_ref": False, "line_clean": False, "line_mask": True, "block_size": 41, "C": 10},
+    ]
+
+    if enable_lineclean:
+        for r in LINE_INPAINT_RADII:
+            variants += [
+                {"name": f"lc_gray2x_r{r}", "thresh": "none", "inv": False, "scale": 2.0, "blur": 0, "denoise": False, "morph_close": False,
+                 "dot_ref": False, "line_clean": True, "inpaint_radius": r, "line_mask": True},
+                {"name": f"lc_otsu2x_r{r}", "thresh": "otsu", "inv": False, "scale": 2.0, "blur": 3, "denoise": False, "morph_close": True,
+                 "dot_ref": False, "line_clean": True, "inpaint_radius": r, "line_mask": True},
+                {"name": f"lc_ag2x_b41_c10_r{r}", "thresh": "adaptive_gauss", "inv": False, "scale": 2.0, "blur": 3, "denoise": True, "morph_close": True,
+                 "dot_ref": False, "line_clean": True, "inpaint_radius": r, "line_mask": True, "block_size": 41, "C": 10},
+            ]
+
+    info = pdfinfo_from_path(str(pdf_path))
+    page_count = int(info.get("Pages", 1))
+
+    all_candidates: list[dict] = []
+    table_candidates: list[dict] = []
+    global_callouts = defaultdict(int)
+
+    threads = int(threads) if int(threads) > 0 else 1
+
+    print(f"PDF pages: {page_count}")
+    print(f"Quality={quality}  dpi_list={dpi_list}")
+    print(f"Angles={len(angles)} rotations  fallback_tile_angles={len(fallback_tile_angles)}  callout_angles={len(callout_angles)}")
+    print(f"Variants={len(variants)}  OCR configs={len(ocr_configs)}  Table configs={len(table_configs)}")
+    print(f"Parallel angle threads={threads}")
+
+    basis_cands_all = []
+
+    for page_idx in range(1, page_count + 1):
+        print(f"\n=== Page {page_idx}/{page_count} ===")
+
+        for dpi in dpi_list:
+            print(f"  Render @ {dpi} DPI...")
+            imgs = convert_from_path(str(pdf_path), dpi=int(dpi), first_page=page_idx, last_page=page_idx)
+            if not imgs:
+                continue
+            page_img = imgs[0]
+
+            # callouts for line/curve references
+            callouts = scan_label_callouts(page_img, callout_angles, tess_timeout=tess_timeout)
+            for k, v in callouts.items():
+                global_callouts[k] += v
+
+            # basis scan (lightweight)
+            basis_cands = detect_basis_candidates_on_page(page_img, basis_angles, tess_timeout=tess_timeout)
+            for bc in basis_cands:
+                bc["page"] = page_idx
+                bc["dpi"] = int(dpi)
+            basis_cands_all.extend(basis_cands)
+
+            futures = []
+            with ThreadPoolExecutor(max_workers=threads) as ex:
+                for angle in angles:
+                    futures.append(ex.submit(
+                        _process_one_angle,
+                        page_img, page_idx, int(dpi), float(angle),
+                        fallback_tile_angles, int(roi_pad), int(max_rois),
+                        bool(enable_tables), debug_dir,
+                        ocr_configs, table_configs, variants, tess_timeout, engines
+                    ))
+
+                for fut in as_completed(futures):
+                    roi_cands, tbl_cands = fut.result()
+                    all_candidates.extend(roi_cands)
+                    table_candidates.extend(tbl_cands)
+
+            print(f"  candidates so far: roi={len(all_candidates)} table={len(table_candidates)} callouts={len(global_callouts)} basis={len(basis_cands_all)}")
+
+    winners = []
+
+    if all_candidates:
+        clusters = cluster_candidates(all_candidates, dist_tol=float(dist_tol), bear_tol_deg=float(bear_tol_deg))
+        w = [pick_cluster_winner(cl) for cl in clusters]
+        winners.extend([x for x in w if x.get("support", 1) >= int(min_support)])
+
+    if table_candidates:
+        groups = defaultdict(list)
+        for c in table_candidates:
+            groups[(c.get("table_kind"), c.get("ref_id"))].append(c)
+
+        for (tkind, rid), cands in groups.items():
+            if not cands:
+                continue
+            clusters = cluster_candidates(cands, dist_tol=float(dist_tol), bear_tol_deg=float(bear_tol_deg))
+            cluster_winners = [pick_cluster_winner(cl) for cl in clusters]
+            cluster_winners.sort(key=lambda x: (x.get("support", 1), x.get("vote_score", -1e9), x.get("best_conf", -1)), reverse=True)
+            best = cluster_winners[0]
+            best["ref_id"] = rid
+            best["table_kind"] = tkind
+            best["source"] = "voted_table"
+            if best.get("support", 1) >= int(min_support):
+                winners.append(best)
+
+    # basis winner (separate)
+    basis_winner = None
+    if basis_cands_all:
+        # cluster/vote basis candidates too
+        bclusters = cluster_candidates(basis_cands_all, dist_tol=0.50, bear_tol_deg=0.6)
+        bw = [pick_cluster_winner(cl) for cl in bclusters]
+        bw.sort(key=lambda x: (x.get("basis_votes", 0), x.get("support", 1), x.get("vote_score", -1e9), x.get("best_conf", -1)), reverse=True)
+        basis_winner = bw[0]
+        basis_winner["source"] = "basis_of_bearing"
+        basis_winner["table_kind"] = None
+        basis_winner["ref_id"] = None
+
+    # dedupe bests
+    best_map: dict[tuple[str, str, str | None, str | None], dict] = {}
+    for w in winners:
+        k = (w.get("bearing"), w.get("distance"), w.get("ref_id"), w.get("table_kind"))
+        prev = best_map.get(k)
+        if prev is None:
+            best_map[k] = w
+        else:
+            if (w.get("support", 1), w.get("vote_score", -1e9), w.get("best_conf", -1)) > (prev.get("support", 1), prev.get("vote_score", -1e9), prev.get("best_conf", -1)):
+                best_map[k] = w
+
+    out = list(best_map.values())
+
+    # attach callout counts
+    for r in out:
+        rid = r.get("ref_id")
+        r["callout_count"] = int(global_callouts.get(rid, 0)) if rid else 0
+
+    out.sort(key=lambda x: x.get("numeric_dist", 0), reverse=True)
+    return out, dict(global_callouts), basis_winner
+
+# ---------------------------
+# Output helpers
+# ---------------------------
+def fmt_pair_line(p: dict) -> str:
+    rid = p.get("ref_id")
+    prefix = f"{rid}  " if rid else ""
+    rec = p.get("record_distance")
+    if rec:
+        return f"{prefix}{p['bearing']:22}  {p['distance']:>9} ({rec}) ft"
+    return f"{prefix}{p['bearing']:22}  {p['distance']:>9} ft"
+
+# ---------------------------
+# CLI / main
+# ---------------------------
+def main():
+    parser = argparse.ArgumentParser(description="Extract bearings & distances from ROS scanned PDFs (ultra/max quality)")
+    parser.add_argument("file", help="Path to PDF")
+
+    parser.add_argument("--quality", choices=["fast", "balanced", "max"], default="max",
+                        help="Quality preset. 'max' is hours-OK exhaustive mode (default).")
+
+    parser.add_argument("--threads", type=int, default=16,
+                        help="Thread pool size for parallel angle processing (default 16).")
+
+    parser.add_argument("--omp-thread-limit", type=int, default=None,
+                        help="Set OMP_THREAD_LIMIT (recommended 1 when using many threads). If not set and --threads>1, defaults to 1 unless already defined in env.")
+
+    parser.add_argument("--dpi-list", default="", help="Override DPI list (comma-separated), e.g. 500,650,800")
+    parser.add_argument("--angles", default="", help="Override angles list (comma-separated degrees). Empty uses quality preset.")
+    parser.add_argument("--fallback-tile-angles", default="", help="Override fallback tile angles list (comma-separated). Empty uses preset.")
+    parser.add_argument("--callout-angles", default="", help="Override callout angles list (comma-separated). Empty uses preset.")
+    parser.add_argument("--basis-angles", default="", help="Override basis scan angles (comma-separated). Empty uses preset.")
+
+    parser.add_argument("--roi-pad", type=int, default=None)
+    parser.add_argument("--max-rois", type=int, default=None)
+    parser.add_argument("--min-support", type=int, default=None)
+    parser.add_argument("--dist-tol", type=float, default=None)
+    parser.add_argument("--bear-tol-deg", type=float, default=None)
+
+    parser.add_argument("--debug-rois", help="Directory to save ROI crops")
+    parser.add_argument("--no-lineclean", action="store_true", help="Disable linework inpaint passes")
+    parser.add_argument("--no-tables", action="store_true", help="Disable line/curve table extraction")
+
+    parser.add_argument("--no-paddle", action="store_true", help="Disable PaddleOCR engine even if installed")
+    parser.add_argument("--no-doctr", action="store_true", help="Disable DocTR engine even if installed")
+
+    parser.add_argument("--tess-timeout", type=int, default=0,
+                        help="Per-Tesseract call timeout seconds (0 disables). Use 0 for max quality.")
+    parser.add_argument("--verbose", "-v", action="store_true")
+    parser.add_argument("--output", "-o", help="Save as JSON")
+    args = parser.parse_args()
+
+    # Avoid oversubscription: many concurrent tesseracts can each spin up multiple OpenMP threads.
+    if args.omp_thread_limit is not None:
+        os.environ["OMP_THREAD_LIMIT"] = str(int(args.omp_thread_limit))
+    else:
+        if int(args.threads) > 1 and "OMP_THREAD_LIMIT" not in os.environ:
+            os.environ["OMP_THREAD_LIMIT"] = "1"
+
+    pdf = Path(args.file)
+    if not pdf.is_file():
+        print("File not found.")
+        sys.exit(1)
+
+    dpi_list = [int(x) for x in parse_float_list(args.dpi_list)] if args.dpi_list.strip() else None
+    angles = parse_float_list(args.angles) if args.angles.strip() else None
+    fallback_tile_angles = set(parse_float_list(args.fallback_tile_angles)) if args.fallback_tile_angles.strip() else None
+    callout_angles = parse_float_list(args.callout_angles) if args.callout_angles.strip() else None
+    basis_angles = parse_float_list(args.basis_angles) if args.basis_angles.strip() else None
+
+    debug_dir = Path(args.debug_rois) if args.debug_rois else None
+    tess_timeout = int(args.tess_timeout) if int(args.tess_timeout) > 0 else None
+
+    # init optional engines
+    engines = {"paddle": None, "doctr": None}
+    if not args.no_paddle and _PADDLE_OK:
+        try:
+            engines["paddle"] = PaddleOcrEngine(lang="en")
+            print("[engine] PaddleOCR enabled")
+        except Exception as e:
+            print(f"[engine] PaddleOCR init failed; continuing without it: {e}")
+            engines["paddle"] = None
+    else:
+        if args.no_paddle:
+            print("[engine] PaddleOCR disabled by flag")
+        elif not _PADDLE_OK:
+            print("[engine] PaddleOCR not installed")
+
+    if not args.no_doctr and _DOCTR_OK:
+        try:
+            engines["doctr"] = DoctrOcrEngine()
+            print(f"[engine] DocTR enabled (device={engines['doctr'].device})")
+        except Exception as e:
+            print(f"[engine] DocTR init failed; continuing without it: {e}")
+            engines["doctr"] = None
+    else:
+        if args.no_doctr:
+            print("[engine] DocTR disabled by flag")
+        elif not _DOCTR_OK:
+            print("[engine] DocTR not installed")
+
+    pairs, callouts, basis = extract_pairs_from_pdf(
+        pdf_path=pdf,
+        quality=args.quality,
+        dpi_list=dpi_list,
+        angles=angles,
+        fallback_tile_angles=fallback_tile_angles,
+        callout_angles=callout_angles,
+        basis_angles=basis_angles,
+        roi_pad=args.roi_pad,
+        max_rois=args.max_rois,
+        dist_tol=args.dist_tol,
+        bear_tol_deg=args.bear_tol_deg,
+        min_support=args.min_support,
+        enable_lineclean=not args.no_lineclean,
+        enable_tables=not args.no_tables,
+        debug_dir=debug_dir,
+        tess_timeout=tess_timeout,
+        threads=int(args.threads),
+        engines=engines,
+    )
+
+    # Dedup
+    seen = set()
+    uniq = []
+    for p in pairs:
+        k = (p.get("bearing"), p.get("distance"), p.get("ref_id"), p.get("table_kind"))
+        if k not in seen:
+            seen.add(k)
+            uniq.append(p)
+    uniq.sort(key=lambda x: x.get("numeric_dist", 0), reverse=True)
+    pairs = uniq
+
+    print("\n" + "=" * 92)
+    print("EXTRACTED BEARING → MEASURED DISTANCE (RECORD)   +   LINE/CURVE TABLE ROWS (L#/C#)")
+    print("=" * 92)
+
+    if basis:
+        print("\nBASIS OF BEARING (best guess):")
+        print(f"  {basis.get('bearing')}   {basis.get('distance')} ft   (support={basis.get('support')}, conf={basis.get('best_conf', -1):.1f})")
+        if args.verbose:
+            ex = (basis.get("example_raw") or "").replace("\n", " ").strip()
+            if len(ex) > 260:
+                ex = ex[:260] + "..."
+            if ex:
+                print(f"    Example OCR: {ex}")
+
+    if not pairs:
+        print("\nNo valid pairs found.")
+        return
+
+    for i, p in enumerate(pairs, 1):
+        support = p.get("support", 1)
+        conf = p.get("best_conf", -1)
+        ov = p.get("avg_line_overlap", 0.0)
+        src = p.get("source", "unknown")
+        tk = p.get("table_kind")
+        cc = p.get("callout_count", 0)
+        tk_s = f", {tk}" if tk else ""
+        rid = p.get("ref_id")
+        rid_s = f"{rid} " if rid else ""
+        print(f"{i:3d}. {rid_s}{fmt_pair_line(p)}   (support={support}, conf={conf:.1f}, overlap={ov:.2f}, callouts={cc}, {src}{tk_s})")
+
+        if args.verbose:
+            ex = (p.get("example_raw") or "").replace("\n", " ").strip()
+            if len(ex) > 260:
+                ex = ex[:260] + "..."
+            if ex:
+                print(f"     Example OCR: {ex}")
+
+            if p.get("dist_quality_votes"):
+                dqs = ", ".join([f"{x['quality']}×{x['count']}" for x in p["dist_quality_votes"]])
+                print(f"     Meas evidence: {dqs}")
+
+            if p.get("record_quality_votes"):
+                rqs = ", ".join([f"{x['quality']}×{x['count']}" for x in p["record_quality_votes"]])
+                print(f"     Rec evidence:  {rqs}")
+
+            if p.get("pass_breakdown"):
+                pb = ", ".join([f"{x['engine']}:{x['pass']}×{x['count']}" for x in p["pass_breakdown"][:6]])
+                print(f"     Pass votes:    {pb}")
+
+            if p.get("angle_votes"):
+                top_angles = ", ".join([f"{x['angle']:+.0f}°×{x['count']}" for x in p["angle_votes"][:6]])
+                print(f"     Angle votes:   {top_angles}")
+
+            if p.get("dpi_votes"):
+                top_dpis = ", ".join([f"{x['dpi']}×{x['count']}" for x in p["dpi_votes"][:6]])
+                print(f"     DPI votes:     {top_dpis}")
+            print()
+
+    print(f"\nTotal unique pairs: {len(pairs)}")
+
+    if callouts:
+        top = sorted(callouts.items(), key=lambda kv: kv[0])
+        shown = 0
+        print("\nCallout counts (L#/C# occurrences detected):")
+        for k, v in top:
+            if v <= 0:
+                continue
+            print(f"  {k}: {v}")
+            shown += 1
+            if shown >= 60:
+                print("  ...")
+                break
+
+    if args.output:
+        with open(args.output, "w") as f:
+            json.dump({
+                "file": str(pdf),
+                "quality": args.quality,
+                "threads": int(args.threads),
+                "omp_thread_limit": os.environ.get("OMP_THREAD_LIMIT"),
+                "basis_of_bearing": {
+                    "bearing": basis.get("bearing"),
+                    "distance": basis.get("distance"),
+                    "support": basis.get("support"),
+                    "best_conf": basis.get("best_conf"),
+                    "example_raw": basis.get("example_raw"),
+                } if basis else None,
+                "pairs": [
+                    {
+                        "ref_id": p.get("ref_id"),
+                        "table_kind": p.get("table_kind"),
+                        "bearing": p.get("bearing"),
+                        "distance": p.get("distance"),
+                        "record_distance": p.get("record_distance"),
+                        "callout_count": p.get("callout_count", 0),
+                        "source": p.get("source"),
+                        "support": p.get("support"),
+                        "avg_line_overlap": p.get("avg_line_overlap"),
+                        "best_conf": p.get("best_conf"),
+                        "vote_score": p.get("vote_score"),
+                        "basis_votes": p.get("basis_votes", 0),
+                        "dist_quality_votes": p.get("dist_quality_votes", []),
+                        "record_quality_votes": p.get("record_quality_votes", []),
+                        "angle_votes": p.get("angle_votes", []),
+                        "dpi_votes": p.get("dpi_votes", []),
+                        "pass_breakdown": p.get("pass_breakdown", []),
+                        "example_raw": p.get("example_raw", ""),
+                    }
+                    for p in pairs
+                ],
+                "count": len(pairs),
+                "callouts": callouts
+            }, f, indent=2)
+        print(f"\nResults saved to {args.output}")
+
+if __name__ == "__main__":
     main()
