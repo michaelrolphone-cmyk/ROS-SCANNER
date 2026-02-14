@@ -1,34 +1,40 @@
 #!/usr/bin/env python3
 """
-OCR script to extract bearings and distances from Record of Survey PDFs.
+Max-quality OCR script to extract bearings and distances from Record of Survey PDFs.
 
-Adds:
-- Multi-angle scan
-- ROI detect + fallback tiling
-- Multi-pass OCR voting
-- Linework detection + inpaint cleanup
-- Decimal-dot pixel evidence (no "digit length" guessing)
-- Filters for acres/dates/titleblock-ish noise
+Key features:
+- Multi-DPI scan + voting across DPIs
+- Full 360° multi-angle scan (dense angles in max quality)
+- ROI detection + fallback full-page tiling (multi-angle)
+- Multi-pass OCR (multiple PSM/OEM + multiple preprocess variants)
+- Linework detection + inpaint cleanup + overlap penalties (reduces hallucinated digits)
+- Decimal point recovery via pixel evidence (detect dot blobs inside the token region)
+- Filters for acres/area, title block dates/metadata
 - Record distance capture: 123.45 (124)
-- Line Table extraction (L1, L2...) + Curve Table extraction (C1, C2...)
-- Callout scan for L#/C# references
+- Line Table / Curve Table extraction (L1/L2..., C1/C2...) + callout counting
+- NEW: Multithreaded per-angle processing via ThreadPoolExecutor (--threads)
 
 Install:
   pip install pytesseract pdf2image Pillow opencv-python-headless numpy
+
+Usage (max quality, threaded):
+  python grokpt.py file.pdf --quality max --threads 16 --output out.json --verbose
 """
 
 import re
 import sys
+import os
 import json
 import argparse
 import warnings
 from pathlib import Path
 from collections import Counter, defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 try:
     import pytesseract
     from pytesseract import Output
-    from pdf2image import convert_from_path
+    from pdf2image import convert_from_path, pdfinfo_from_path
     from PIL import Image
     import cv2
     import numpy as np
@@ -38,25 +44,30 @@ except ImportError as e:
     sys.exit(1)
 
 # ---------------------------
-# PIL large-image safety
+# PIL / large image safety
 # ---------------------------
 
-Image.MAX_IMAGE_PIXELS = 500_000_000
+Image.MAX_IMAGE_PIXELS = 800_000_000
 warnings.simplefilter("ignore", Image.DecompressionBombWarning)
 
-MAX_DET_PIXELS = 12_000_000
-MAX_ROI_PIXELS = 18_000_000
-MAX_VARIANT_PIXELS = 18_000_000
+# Pixel budget controls (keep you from OOM when DPI is huge)
+MAX_DET_PIXELS = 12_000_000         # low-res detection stage budget
+MAX_ROI_PIXELS = 18_000_000         # per ROI crop budget (tiling splits if larger)
+MAX_VARIANT_PIXELS = 18_000_000     # per preprocess variant scaling cap
 
-DEFAULT_ANGLES = [-90, -75, -60, -45, -30, -15, 0, 15, 30, 45, 60, 75, 90]
-
+# ---------------------------
 # Linework filtering controls
-LINE_OVERLAP_HARD_REJECT = 0.55   # if line mask covers >55% of token bbox, skip candidate
-LINE_OVERLAP_PENALTY_WT  = 2.8    # score penalty weight during voting
-LINE_INPAINT_RADIUS      = 3
+# ---------------------------
 
+LINE_OVERLAP_HARD_REJECT = 0.60   # if line mask covers >60% of token bbox, skip candidate
+LINE_OVERLAP_PENALTY_WT  = 3.0    # score penalty weight during voting
+LINE_INPAINT_RADII       = [2, 3, 4]  # try multiple line-inpaint radii in max mode
+
+# ---------------------------
 # Metadata / clutter filters
-HEADER_FOOTER_STRIP_FRAC = 0.08   # ignore candidates whose global bbox is in top/bottom 8% of page during full tiling fallback
+# ---------------------------
+
+HEADER_FOOTER_STRIP_FRAC = 0.08   # ignore candidates in top/bottom 8% during full-page tiling
 METADATA_KEYWORDS = {
     "recorded", "filed", "re-recorded", "rerecorded", "instrument", "instr", "doc", "document",
     "book", "page", "index", "ros", "r.o.s", "survey", "county", "auditor", "assessor",
@@ -71,7 +82,6 @@ MONTHS = {
 AREA_UNITS_RE = re.compile(
     r"(?i)\b(a\.?\s*c\.?|acres?|acre|sq\.?\s*ft|sqft|s\.?\s*f\.?|sf|square\s+feet)\b"
 )
-
 YEAR_RE = re.compile(r"\b(19|20)\d{2}\b")
 DATE_RE = re.compile(r"\b\d{1,2}[/-]\d{1,2}[/-](?:\d{2}|\d{4})\b")
 
@@ -111,8 +121,6 @@ CANDIDATE_LINE_RE = re.compile(
 # Table labels
 LINE_ID_RE = re.compile(r"(?i)\bL[\s\-]?\d{1,3}\b")
 CURVE_ID_RE = re.compile(r"(?i)\bC[\s\-]?\d{1,3}\b")
-
-# Curve table keywords / hints
 CURVE_HINT_RE = re.compile(r"(?i)\b(chord|delta|radius|length|arc|tangent)\b")
 
 def _clean_digits(s: str) -> str:
@@ -149,7 +157,6 @@ def parse_bearing_to_canon(bearing_text: str) -> str | None:
     except ValueError:
         return None
 
-    # Fix common OCR: 189 -> 89, 100 -> 0, etc.
     if deg > 90:
         if 100 <= deg < 190:
             deg -= 100
@@ -158,7 +165,6 @@ def parse_bearing_to_canon(bearing_text: str) -> str | None:
         elif 300 <= deg < 390:
             deg -= 300
 
-    # Fix minutes/seconds wrap errors
     if 60 <= minute <= 99:
         minute -= 60
     if 60 <= sec <= 99:
@@ -190,23 +196,17 @@ def bearing_theta_deg(canon_bearing: str) -> float | None:
 # ---------------------------
 
 def _adaptive_inv(gray: np.ndarray) -> np.ndarray:
-    """Binary image with dark strokes as white (255)."""
     return cv2.adaptiveThreshold(
         gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
         cv2.THRESH_BINARY_INV, 31, 10
     )
 
 def build_line_mask(gray: np.ndarray) -> np.ndarray:
-    """
-    Mask 255 where linework is likely:
-      - morphology (horizontal+vertical)
-      - long Hough segments for diagonals / leaders / boundaries
-    """
     h, w = gray.shape[:2]
     bw = _adaptive_inv(gray)
 
-    hk = max(35, w // 16)
-    vk = max(35, h // 16)
+    hk = max(25, w // 18)
+    vk = max(25, h // 18)
 
     horiz = cv2.morphologyEx(
         bw, cv2.MORPH_OPEN,
@@ -222,12 +222,12 @@ def build_line_mask(gray: np.ndarray) -> np.ndarray:
     mask = cv2.bitwise_or(horiz, vert)
 
     edges = cv2.Canny(gray, 60, 160)
-    min_len = max(70, int(0.45 * min(w, h)))
+    min_len = max(60, int(0.28 * min(w, h)))
     lines = cv2.HoughLinesP(
         edges, 1, np.pi / 180,
-        threshold=80,
+        threshold=70,
         minLineLength=min_len,
-        maxLineGap=10
+        maxLineGap=12
     )
 
     if lines is not None:
@@ -241,9 +241,9 @@ def build_line_mask(gray: np.ndarray) -> np.ndarray:
     mask = cv2.dilate(mask, np.ones((3, 3), np.uint8), iterations=1)
     return mask
 
-def remove_linework(gray: np.ndarray, radius: int = LINE_INPAINT_RADIUS) -> tuple[np.ndarray, np.ndarray]:
+def remove_linework(gray: np.ndarray, radius: int) -> tuple[np.ndarray, np.ndarray]:
     mask = build_line_mask(gray)
-    cleaned = cv2.inpaint(gray, mask, inpaintRadius=radius, flags=cv2.INPAINT_TELEA)
+    cleaned = cv2.inpaint(gray, mask, inpaintRadius=int(radius), flags=cv2.INPAINT_TELEA)
     return cleaned, mask
 
 def mask_overlap_ratio(mask: np.ndarray, bbox: tuple[int, int, int, int]) -> float:
@@ -291,24 +291,20 @@ def detect_decimal_dot_digits_right(dot_ref_pil: Image.Image, word_bbox: tuple[i
         if area <= 0:
             continue
         comps.append((i, x, y, cw, ch, area, float(centroids[i][0]), float(centroids[i][1])))
-
     if not comps:
         return None
 
     areas = sorted([c[5] for c in comps], reverse=True)
     top = areas[:6]
-    if not top:
+    median_big = float(np.median(top)) if top else 0.0
+    if median_big <= 0:
         return None
-    median_big = float(np.median(top))
 
     digit_comps = []
     for (i, x, y, cw, ch, area, cx, cy) in comps:
         if area < max(6, 0.10 * median_big):
             continue
-        if ch < max(6, int(0.35 * h)) and median_big > 60:
-            continue
         digit_comps.append((i, x, y, cw, ch, area, cx, cy))
-
     if len(digit_comps) < 2:
         return None
 
@@ -330,7 +326,6 @@ def detect_decimal_dot_digits_right(dot_ref_pil: Image.Image, word_bbox: tuple[i
             continue
         if cy < cy_med:
             continue
-
         ar = cw / max(1.0, float(ch))
         ar = ar if ar >= 1.0 else 1.0 / ar
         if ar > 3.0:
@@ -341,7 +336,6 @@ def detect_decimal_dot_digits_right(dot_ref_pil: Image.Image, word_bbox: tuple[i
         score += (1.0 - min(1.0, (ar - 1.0) / 2.0)) * 1.5
         score += (min(1.0, (cy - cy_med) / max(1.0, (0.40 * h)))) * 1.0
         score += fill * 0.8
-
         dot_candidates.append((score, cx, cy, i))
 
     if not dot_candidates:
@@ -370,22 +364,19 @@ def parse_distance_with_quality(
     dist_text: str,
     dot_digits_right: int | None = None,
     min_ft: float = 1.0,
-    max_ft: float = 1_000_000.0,
+    max_ft: float = 50_000_000.0,
 ) -> tuple[float | None, str]:
     if not dist_text:
         return None, "invalid"
 
-    s = (dist_text or "").strip()
-    s = s.replace(" ", "")
+    s = (dist_text or "").strip().replace(" ", "")
     s = s.replace("·", ".").replace("•", ".").replace("∙", ".").replace("⋅", ".")
 
-    # If token contains a record-paren glued on (e.g. "123.45(124)"), drop the paren part for measured parse
     if "(" in s:
         s = s.split("(", 1)[0].strip()
     if not s:
         return None, "invalid"
 
-    # comma-as-decimal
     if s.count(",") == 1 and "." not in s:
         left, right = s.split(",", 1)
         if right.isdigit() and len(right) in (2, 3) and left.replace(",", "").isdigit():
@@ -425,7 +416,6 @@ def parse_distance_with_quality(
             except ValueError:
                 pass
 
-    # Otherwise treat as integer (no guessing)
     try:
         v = float(digits)
         if min_ft <= v <= max_ft:
@@ -447,15 +437,15 @@ def rotate_keep_size(pil_img: Image.Image, angle_deg: float) -> Image.Image:
     arr = np.array(pil_img.convert("RGB"))
     h, w = arr.shape[:2]
 
-    if abs(a - 90.0) < 1e-9:
+    if abs((a % 360) - 90.0) < 1e-9:
         out = cv2.rotate(arr, cv2.ROTATE_90_COUNTERCLOCKWISE)
         out = cv2.resize(out, (w, h), interpolation=cv2.INTER_CUBIC) if (out.shape[1], out.shape[0]) != (w, h) else out
         return Image.fromarray(out)
-    if abs(a + 90.0) < 1e-9:
+    if abs((a % 360) - 270.0) < 1e-9:
         out = cv2.rotate(arr, cv2.ROTATE_90_CLOCKWISE)
         out = cv2.resize(out, (w, h), interpolation=cv2.INTER_CUBIC) if (out.shape[1], out.shape[0]) != (w, h) else out
         return Image.fromarray(out)
-    if abs(abs(a) - 180.0) < 1e-9:
+    if abs((a % 360) - 180.0) < 1e-9:
         return Image.fromarray(cv2.rotate(arr, cv2.ROTATE_180))
 
     center = (w / 2.0, h / 2.0)
@@ -472,9 +462,16 @@ def rotate_keep_size(pil_img: Image.Image, angle_deg: float) -> Image.Image:
 # Preprocess variants
 # ---------------------------
 
+def _apply_clahe(gray: np.ndarray, clip: float = 2.0, grid: int = 8) -> np.ndarray:
+    clahe = cv2.createCLAHE(clipLimit=float(clip), tileGridSize=(int(grid), int(grid)))
+    return clahe.apply(gray)
+
 def preprocess_variant(pil_img: Image.Image, variant: dict) -> tuple[Image.Image, dict]:
     arr = np.array(pil_img.convert("RGB"))
     gray0 = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
+
+    if variant.get("clahe", False):
+        gray0 = _apply_clahe(gray0, clip=variant.get("clahe_clip", 2.0), grid=variant.get("clahe_grid", 8))
 
     scale = float(variant.get("scale", 1.0))
     base_pixels = int(gray0.shape[0] * gray0.shape[1])
@@ -488,12 +485,10 @@ def preprocess_variant(pil_img: Image.Image, variant: dict) -> tuple[Image.Image
     else:
         gray = gray0
 
-    line_mask = None
-    if bool(variant.get("line_mask", True)):
-        line_mask = build_line_mask(gray)
+    line_mask = build_line_mask(gray) if bool(variant.get("line_mask", True)) else None
 
     if bool(variant.get("line_clean", False)):
-        gray, _ = remove_linework(gray, radius=int(variant.get("inpaint_radius", LINE_INPAINT_RADIUS)))
+        gray, _ = remove_linework(gray, radius=int(variant.get("inpaint_radius", 3)))
 
     inv = bool(variant.get("inv", False))
     thresh = variant.get("thresh", "adaptive_gauss")
@@ -504,21 +499,27 @@ def preprocess_variant(pil_img: Image.Image, variant: dict) -> tuple[Image.Image
         proc = Image.fromarray(out)
         return proc, {"scaled_gray": gray, "line_mask": line_mask, "dot_ref": bool(variant.get("dot_ref", False)), "scale_used": float(scale)}
 
+    gray2 = gray
     if blur > 0:
         k = blur if blur % 2 == 1 else blur + 1
-        gray2 = cv2.GaussianBlur(gray, (k, k), 0)
-    else:
-        gray2 = gray
+        gray2 = cv2.GaussianBlur(gray2, (k, k), 0)
+
+    block_size = int(variant.get("block_size", 31))
+    if block_size < 11:
+        block_size = 11
+    if block_size % 2 == 0:
+        block_size += 1
+    C = int(variant.get("C", 10))
 
     if thresh == "adaptive_gauss":
         out = cv2.adaptiveThreshold(
             gray2, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-            cv2.THRESH_BINARY_INV if inv else cv2.THRESH_BINARY, 31, 10
+            cv2.THRESH_BINARY_INV if inv else cv2.THRESH_BINARY, block_size, C
         )
     elif thresh == "adaptive_mean":
         out = cv2.adaptiveThreshold(
             gray2, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
-            cv2.THRESH_BINARY_INV if inv else cv2.THRESH_BINARY, 31, 10
+            cv2.THRESH_BINARY_INV if inv else cv2.THRESH_BINARY, block_size, C
         )
     elif thresh == "otsu":
         mode = (cv2.THRESH_BINARY_INV if inv else cv2.THRESH_BINARY) | cv2.THRESH_OTSU
@@ -540,8 +541,11 @@ def preprocess_variant(pil_img: Image.Image, variant: dict) -> tuple[Image.Image
 # OCR: keep word bboxes
 # ---------------------------
 
-def ocr_image_to_lines_with_words(pil_img: Image.Image, config: str) -> list[dict]:
-    data = pytesseract.image_to_data(pil_img, config=config, lang="eng", output_type=Output.DICT)
+def ocr_image_to_lines_with_words(pil_img: Image.Image, config: str, timeout: int | None = None) -> list[dict]:
+    data = pytesseract.image_to_data(
+        pil_img, config=config, lang="eng", output_type=Output.DICT,
+        timeout=timeout
+    )
 
     n = len(data.get("text", []))
     lines: dict[tuple[int, int, int], dict] = {}
@@ -643,7 +647,7 @@ def clamp_rect(r, w, h):
         y2 = min(h, y1 + 2)
     return (x1, y1, x2, y2)
 
-def tile_rect(r, page_w, page_h, max_pixels=MAX_ROI_PIXELS, overlap=120) -> list[tuple[int, int, int, int]]:
+def tile_rect(r, page_w, page_h, max_pixels=MAX_ROI_PIXELS, overlap=140) -> list[tuple[int, int, int, int]]:
     x1, y1, x2, y2 = r
     w = x2 - x1
     h = y2 - y1
@@ -654,7 +658,7 @@ def tile_rect(r, page_w, page_h, max_pixels=MAX_ROI_PIXELS, overlap=120) -> list
         return [clamp_rect(r, page_w, page_h)]
 
     n = int(np.ceil(np.sqrt(area / max_pixels)))
-    n = max(2, min(n, 6))
+    n = max(2, min(n, 7))
 
     tw = int(np.ceil(w / n))
     th = int(np.ceil(h / n))
@@ -674,7 +678,7 @@ def tile_rect(r, page_w, page_h, max_pixels=MAX_ROI_PIXELS, overlap=120) -> list
 # ROI detection: bearing/distance callouts
 # ---------------------------
 
-def detect_bearing_distance_rois(page_img: Image.Image, roi_pad: int = 55, max_rois: int = 35) -> list[tuple[int, int, int, int]]:
+def detect_bearing_distance_rois(page_img: Image.Image, roi_pad: int = 55, max_rois: int = 60) -> list[tuple[int, int, int, int]]:
     W, H = page_img.size
     page_pixels = W * H
     scale = min(1.0, (MAX_DET_PIXELS / page_pixels) ** 0.5) if page_pixels > 0 else 1.0
@@ -712,7 +716,7 @@ def detect_bearing_distance_rois(page_img: Image.Image, roi_pad: int = 55, max_r
         bw = x2 - x1
         bh = y2 - y1
 
-        if bh > 0.18 * sH:
+        if bh > 0.20 * sH:
             continue
         if bw > 0.98 * sW and bh > 0.06 * sH:
             continue
@@ -739,7 +743,7 @@ def detect_bearing_distance_rois(page_img: Image.Image, roi_pad: int = 55, max_r
         return []
 
     scored.sort(key=lambda x: x[0], reverse=True)
-    rects = [r for _, r in scored[: max_rois * 2]]
+    rects = [r for _, r in scored[: max_rois * 3]]
     rects = merge_rects(rects)
 
     page_area = W * H
@@ -757,11 +761,7 @@ TABLE_KEYWORDS = {
     "table", "line", "curve", "bearing", "distance", "chord", "delta", "radius", "length", "arc"
 }
 
-def detect_table_rois(page_img: Image.Image, max_tables: int = 6) -> list[tuple[str, tuple[int, int, int, int]]]:
-    """
-    Returns list of (kind, rect) where kind ∈ {"line_table","curve_table"}.
-    Uses a low-res OCR keyword scan to locate table headers, then expands downward to include rows.
-    """
+def detect_table_rois(page_img: Image.Image, max_tables: int = 10) -> list[tuple[str, tuple[int, int, int, int]]]:
     W, H = page_img.size
     page_pixels = W * H
     scale = min(1.0, (MAX_DET_PIXELS / page_pixels) ** 0.5) if page_pixels > 0 else 1.0
@@ -779,7 +779,6 @@ def detect_table_rois(page_img: Image.Image, max_tables: int = 6) -> list[tuple[
                                cv2.THRESH_BINARY, 41, 11)
     pil = Image.fromarray(bw)
 
-    # IMPORTANT: do NOT include quote characters in whitelist (shlex will explode).
     whitelist = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789()°.,-"
     cfg = f'--oem 3 --psm 6 -c preserve_interword_spaces=1 -c tessedit_char_whitelist={whitelist}'
     data = pytesseract.image_to_data(pil, config=cfg, lang="eng", output_type=Output.DICT)
@@ -797,8 +796,7 @@ def detect_table_rois(page_img: Image.Image, max_tables: int = 6) -> list[tuple[
         if conf < 35:
             continue
 
-        tl = t.lower()
-        tl = re.sub(r"[^a-z0-9]", "", tl)
+        tl = re.sub(r"[^a-z0-9]", "", t.lower())
         if not tl:
             continue
         if tl in TABLE_KEYWORDS:
@@ -815,7 +813,7 @@ def detect_table_rois(page_img: Image.Image, max_tables: int = 6) -> list[tuple[
         cy = (bb[1] + bb[3]) / 2.0
         placed = False
         for cl in clusters:
-            if abs(cx - cl["cx"]) < 260 and abs(cy - cl["cy"]) < 160:
+            if abs(cx - cl["cx"]) < 280 and abs(cy - cl["cy"]) < 170:
                 cl["items"].append((kw, conf, bb))
                 cl["cx"] = (cl["cx"] * 0.7 + cx * 0.3)
                 cl["cy"] = (cl["cy"] * 0.7 + cy * 0.3)
@@ -847,13 +845,13 @@ def detect_table_rois(page_img: Image.Image, max_tables: int = 6) -> list[tuple[
         x1 = min(xs); y1 = min(ys); x2 = max(xe); y2 = max(ye)
 
         header_h = max(12, y2 - y1)
-        pad_x = int(0.16 * sW)
+        pad_x = int(0.18 * sW)
         pad_y = int(0.05 * sH)
 
         x1 = max(0, x1 - pad_x)
         x2 = min(sW, x2 + pad_x)
         y1 = max(0, y1 - pad_y)
-        y2 = min(sH, y2 + max(int(0.35 * sH), 16 * header_h))
+        y2 = min(sH, y2 + max(int(0.40 * sH), 18 * header_h))
 
         if scale != 1.0:
             ox1 = int(x1 / scale)
@@ -921,7 +919,7 @@ def parse_record_distance_from_following(
     join = ""
     bbox_for_dot = None
 
-    for j in range(dist_idx, min(len(words), dist_idx + 5)):
+    for j in range(dist_idx, min(len(words), dist_idx + 6)):
         tok = (words[j]["text"] or "")
         join += tok
 
@@ -942,7 +940,7 @@ def parse_record_distance_from_following(
         if dot_ref_img is not None and bbox_for_dot is not None:
             dot_digits_right = detect_decimal_dot_digits_right(dot_ref_img, bbox_for_dot)
 
-        v, q = parse_distance_with_quality(inside2, dot_digits_right=dot_digits_right, min_ft=0.0, max_ft=1_000_000.0)
+        v, q = parse_distance_with_quality(inside2, dot_digits_right=dot_digits_right, min_ft=0.0, max_ft=50_000_000.0)
         if v is None:
             return None, None, None
 
@@ -1008,7 +1006,7 @@ def extract_pairs_from_line_words(
     texts = [w["text"] for w in line_words]
 
     for i in range(len(texts)):
-        for win in (3, 4, 5, 6):
+        for win in (3, 4, 5, 6, 7):
             j = min(len(texts), i + win)
             snippet = " ".join(texts[i:j])
             bm = BEARING_RE.search(snippet)
@@ -1021,7 +1019,7 @@ def extract_pairs_from_line_words(
                 continue
 
             dist_idx = None
-            for k in range(j, min(len(texts), j + 12)):
+            for k in range(j, min(len(texts), j + 14)):
                 tok = (texts[k] or "").strip()
                 if not tok:
                     continue
@@ -1030,7 +1028,7 @@ def extract_pairs_from_line_words(
 
                 if "(" in tok or ")" in tok:
                     if "(" in tok and re.search(r"^\(?\d", tok):
-                        if "." in tok or "·" in tok or "•" in tok or "∙" in tok or "⋅" in tok:
+                        if any(ch in tok for ch in (".", "·", "•", "∙", "⋅")):
                             dist_idx = k
                             break
                     continue
@@ -1045,7 +1043,7 @@ def extract_pairs_from_line_words(
             meas_raw = texts[dist_idx]
             meas_bbox = line_words[dist_idx]["bbox"]
 
-            if has_area_unit_near(line_words, dist_idx, window=4):
+            if has_area_unit_near(line_words, dist_idx, window=5):
                 break
 
             overlap = 0.0
@@ -1074,9 +1072,11 @@ def extract_pairs_from_line_words(
                 "dist_raw": meas_raw,
                 "dist_bbox": meas_bbox,
                 "line_overlap": float(overlap),
+
                 "record_numeric_dist": float(rec_val) if rec_val is not None else None,
                 "record_distance": rec_str,
                 "record_quality": rec_quality,
+
                 "ref_id": ref_id,
             })
             break
@@ -1087,7 +1087,13 @@ def extract_pairs_from_line_words(
 # Multipass OCR on ROI
 # ---------------------------
 
-def multipass_ocr_on_roi(roi_img: Image.Image, ocr_configs: list[tuple[str, str]], variants: list[dict], require_label: bool = False) -> list[dict]:
+def multipass_ocr_on_roi(
+    roi_img: Image.Image,
+    ocr_configs: list[tuple[str, str]],
+    variants: list[dict],
+    require_label: bool,
+    tess_timeout: int | None
+) -> list[dict]:
     candidates = []
     for v in variants:
         proc, aux = preprocess_variant(roi_img, v)
@@ -1095,7 +1101,7 @@ def multipass_ocr_on_roi(roi_img: Image.Image, ocr_configs: list[tuple[str, str]
         line_mask = aux.get("line_mask", None)
 
         for cfg, desc in ocr_configs:
-            lines = ocr_image_to_lines_with_words(proc, cfg)
+            lines = ocr_image_to_lines_with_words(proc, cfg, timeout=tess_timeout)
             for ln in lines:
                 pairs = extract_pairs_from_line_words(
                     line_text=ln["text"],
@@ -1113,17 +1119,21 @@ def multipass_ocr_on_roi(roi_img: Image.Image, ocr_configs: list[tuple[str, str]
                         "numeric_dist": c["numeric_dist"],
                         "theta": theta,
                         "conf": float(ln["conf"]) if ln["conf"] is not None else -1.0,
+
                         "pass_name": v["name"],
                         "config_desc": desc,
                         "raw_line": ln["text"],
+
                         "dist_quality": c.get("dist_quality"),
                         "dist_raw": c.get("dist_raw"),
                         "dist_bbox": c.get("dist_bbox"),
                         "line_overlap": float(c.get("line_overlap", 0.0)),
                         "line_clean": bool(v.get("line_clean", False)),
+
                         "record_numeric_dist": c.get("record_numeric_dist"),
                         "record_distance": c.get("record_distance"),
                         "record_quality": c.get("record_quality"),
+
                         "ref_id": c.get("ref_id"),
                     }
                     candidates.append(cand)
@@ -1163,11 +1173,11 @@ def cluster_candidates(cands: list[dict], dist_tol: float, bear_tol_deg: float) 
 
 def _decimal_evidence_bonus(q: str) -> float:
     if q == "explicit_decimal":
-        return 2.0
+        return 2.2
     if q == "comma_decimal":
-        return 1.5
+        return 1.6
     if q == "dot_blob":
-        return 1.2
+        return 1.3
     if q == "integer":
         return 0.0
     return 0.0
@@ -1185,6 +1195,14 @@ def pick_cluster_winner(cluster: list[dict]) -> dict:
         dec_bonus = sum(_decimal_evidence_bonus(c.get("dist_quality", "")) for c in reps) / max(1, len(reps))
         overlap_avg = sum(float(c.get("line_overlap", 0.0)) for c in reps) / max(1, len(reps))
         score = mean_conf + dec_bonus - (LINE_OVERLAP_PENALTY_WT * overlap_avg)
+
+        dpis = {c.get("dpi") for c in reps}
+        angs = {c.get("angle") for c in reps}
+        if len(dpis) >= 2:
+            score += 0.6
+        if len(angs) >= 3:
+            score += 0.5
+
         return score, mean_conf, dec_bonus, overlap_avg, reps
 
     best_key = None
@@ -1209,8 +1227,6 @@ def pick_cluster_winner(cluster: list[dict]) -> dict:
         if non_none:
             non_none.sort(key=lambda kv: kv[1], reverse=True)
             rec_choice = non_none[0][0]
-        else:
-            rec_choice = None
 
     rec_num = None
     if rec_choice is not None:
@@ -1223,6 +1239,7 @@ def pick_cluster_winner(cluster: list[dict]) -> dict:
     rq = Counter(c.get("record_quality", "none") for c in reps if c.get("record_distance") is not None)
     passes = Counter((c.get("pass_name"), c.get("config_desc")) for c in reps)
     angles = Counter(c.get("angle", 0) for c in reps)
+    dpis = Counter(c.get("dpi", 0) for c in reps)
     linec = Counter("lineclean" if c.get("line_clean") else "raw" for c in reps)
 
     return {
@@ -1247,6 +1264,7 @@ def pick_cluster_winner(cluster: list[dict]) -> dict:
         "example_raw": rep.get("raw_line", ""),
         "source": rep.get("source", "voted_roi"),
         "angle_votes": [{"angle": a, "count": n} for a, n in angles.most_common(8)],
+        "dpi_votes": [{"dpi": d, "count": n} for d, n in dpis.most_common(8)],
         "pass_breakdown": [{"pass": p, "config": cfg, "count": n} for (p, cfg), n in passes.most_common(8)],
     }
 
@@ -1254,7 +1272,7 @@ def pick_cluster_winner(cluster: list[dict]) -> dict:
 # Callout scanning (L# / C# occurrences)
 # ---------------------------
 
-def scan_label_callouts(page_img: Image.Image, angles: list[float]) -> dict[str, int]:
+def scan_label_callouts(page_img: Image.Image, angles: list[float], tess_timeout: int | None) -> dict[str, int]:
     counts = defaultdict(set)
 
     whitelist = "LC0123456789lc-"
@@ -1269,7 +1287,7 @@ def scan_label_callouts(page_img: Image.Image, angles: list[float]) -> dict[str,
         else:
             small = rot
 
-        data = pytesseract.image_to_data(small, config=cfg, lang="eng", output_type=Output.DICT)
+        data = pytesseract.image_to_data(small, config=cfg, lang="eng", output_type=Output.DICT, timeout=tess_timeout)
         n = len(data.get("text", []))
         for i in range(n):
             t = (data["text"][i] or "").strip()
@@ -1318,9 +1336,194 @@ FORCED_DEFAULT = [
 def apply_forced_pairs(results: list[dict], forced: list[dict]) -> list[dict]:
     out = results[:]
     for f in forced:
-        if not any(abs(p.get("numeric_dist", 0) - f["numeric_dist"]) < 2 and str(p.get("bearing", ""))[:10] == f["bearing"][:10] for p in out):
+        if not any(abs(p.get("numeric_dist", 0) - f["numeric_dist"]) < 2 and str(p.get("bearing", ""))[:10] == f['bearing'][:10] for p in out):
             out.append(f)
     return out
+
+# ---------------------------
+# Quality profiles
+# ---------------------------
+
+def parse_float_list(s: str) -> list[float]:
+    out = []
+    for p in (s or "").split(","):
+        p = p.strip()
+        if not p:
+            continue
+        try:
+            out.append(float(p))
+        except ValueError:
+            pass
+    return out
+
+def angles_dense_360(step: float) -> list[float]:
+    step = float(step)
+    if step <= 0:
+        step = 5.0
+    n = int(round(360.0 / step))
+    out = [round(i * step, 6) for i in range(n)]
+    if 0.0 not in out:
+        out.append(0.0)
+    return out
+
+def quality_profile(name: str) -> dict:
+    q = (name or "max").strip().lower()
+
+    if q == "fast":
+        return {
+            "dpi_list": [450],
+            "angles": [0.0, 90.0, 180.0, 270.0],
+            "fallback_tile_angles": {0.0, 90.0, 180.0, 270.0},
+            "callout_angles": [0.0, 90.0, 180.0, 270.0],
+            "min_support": 1,
+            "dist_tol": 0.35,
+            "bear_tol_deg": 0.5,
+            "max_rois": 30,
+            "roi_pad": 55,
+        }
+
+    if q == "balanced":
+        return {
+            "dpi_list": [500],
+            "angles": angles_dense_360(10.0),
+            "fallback_tile_angles": set(angles_dense_360(30.0)),
+            "callout_angles": [0.0, 90.0, 180.0, 270.0],
+            "min_support": 2,
+            "dist_tol": 0.25,
+            "bear_tol_deg": 0.40,
+            "max_rois": 40,
+            "roi_pad": 55,
+        }
+
+    return {
+        "dpi_list": [500, 650, 800],
+        "angles": angles_dense_360(5.0),
+        "fallback_tile_angles": set(angles_dense_360(15.0)),
+        "callout_angles": angles_dense_360(30.0),
+        "min_support": 3,
+        "dist_tol": 0.20,
+        "bear_tol_deg": 0.35,
+        "max_rois": 70,
+        "roi_pad": 60,
+    }
+
+# ---------------------------
+# Parallel angle worker
+# ---------------------------
+
+def _process_one_angle(
+    page_img: Image.Image,
+    page_idx: int,
+    dpi: int,
+    angle: float,
+    fallback_tile_angles: set[float],
+    roi_pad: int,
+    max_rois: int,
+    enable_tables: bool,
+    debug_dir: Path | None,
+    ocr_configs: list[tuple[str, str]],
+    table_configs: list[tuple[str, str]],
+    variants: list[dict],
+    tess_timeout: int | None,
+) -> tuple[list[dict], list[dict]]:
+    """
+    Worker: rotates page to angle, detects ROIs (or tiles), runs multipass OCR, optionally extracts tables.
+    Returns (roi_candidates, table_candidates) for this angle.
+    """
+    rot_img = rotate_keep_size(page_img, angle)
+    W, H = rot_img.size
+
+    rois = detect_bearing_distance_rois(rot_img, roi_pad=int(roi_pad), max_rois=int(max_rois))
+    tiled_mode = False
+    if not rois:
+        if float(angle) in fallback_tile_angles:
+            tiled_mode = True
+            rois = tile_rect((0, 0, W, H), W, H, max_pixels=MAX_ROI_PIXELS, overlap=170)
+        else:
+            rois = []
+
+    roi_candidates: list[dict] = []
+    table_candidates: list[dict] = []
+
+    roi_counter = 0
+    for r in rois:
+        tiles = tile_rect(r, W, H, max_pixels=MAX_ROI_PIXELS, overlap=160)
+        for tr in tiles:
+            roi_counter += 1
+            x1, y1, x2, y2 = tr
+            crop = rot_img.crop((x1, y1, x2, y2))
+
+            if debug_dir:
+                crop_path = debug_dir / f"p{page_idx:02d}_dpi{dpi}_a{int(angle):03d}_roi{roi_counter:04d}_{x1}_{y1}_{x2}_{y2}.png"
+                try:
+                    crop.save(crop_path)
+                except Exception:
+                    pass
+
+            cands = multipass_ocr_on_roi(
+                crop,
+                ocr_configs=ocr_configs,
+                variants=variants,
+                require_label=False,
+                tess_timeout=tess_timeout
+            )
+
+            # annotate + optional header/footer reject in tiled mode
+            for c in cands:
+                c["page"] = page_idx
+                c["dpi"] = int(dpi)
+                c["angle"] = float(angle)
+                c["roi"] = roi_counter
+                c["roi_bbox"] = (x1, y1, x2, y2)
+                c["table_kind"] = None
+                c["source"] = "roi"
+
+                if tiled_mode:
+                    roi_cy = (y1 + y2) / 2.0
+                    c["_rej_hf"] = bool(roi_cy <= HEADER_FOOTER_STRIP_FRAC * H or roi_cy >= (1.0 - HEADER_FOOTER_STRIP_FRAC) * H)
+                else:
+                    c["_rej_hf"] = False
+
+            cands = [c for c in cands if not c.get("_rej_hf")]
+            roi_candidates.extend(cands)
+
+    if enable_tables:
+        table_rois = detect_table_rois(rot_img, max_tables=10)
+        for tkind, tr in table_rois:
+            tx1, ty1, tx2, ty2 = tr
+            tcrop = rot_img.crop((tx1, ty1, tx2, ty2))
+
+            cands = multipass_ocr_on_roi(
+                tcrop,
+                ocr_configs=table_configs,
+                variants=variants,
+                require_label=True,
+                tess_timeout=tess_timeout
+            )
+
+            for c in cands:
+                rid = c.get("ref_id")
+                if not rid:
+                    continue
+                if tkind == "line_table" and not rid.startswith("L"):
+                    continue
+                if tkind == "curve_table" and not rid.startswith("C"):
+                    continue
+
+                raw = (c.get("raw_line") or "")
+                c["curve_hint"] = bool(CURVE_HINT_RE.search(raw))
+
+                c["page"] = page_idx
+                c["dpi"] = int(dpi)
+                c["angle"] = float(angle)
+                c["roi"] = "table"
+                c["roi_bbox"] = (tx1, ty1, tx2, ty2)
+                c["table_kind"] = tkind
+                c["source"] = "table_roi"
+
+                table_candidates.append(c)
+
+    return roi_candidates, table_candidates
 
 # ---------------------------
 # Main extraction
@@ -1328,50 +1531,47 @@ def apply_forced_pairs(results: list[dict], forced: list[dict]) -> list[dict]:
 
 def extract_pairs_from_pdf(
     pdf_path: Path,
-    dpi: int,
-    roi_pad: int,
-    max_rois: int,
-    dist_tol: float,
-    bear_tol_deg: float,
-    min_support: int,
-    debug_dir: Path | None,
-    angles: list[float],
-    fallback_tile_angles: set[float],
+    quality: str,
+    dpi_list: list[int] | None,
+    angles: list[float] | None,
+    fallback_tile_angles: set[float] | None,
+    callout_angles: list[float] | None,
+    roi_pad: int | None,
+    max_rois: int | None,
+    dist_tol: float | None,
+    bear_tol_deg: float | None,
+    min_support: int | None,
     enable_lineclean: bool,
     enable_tables: bool,
-    callout_angles: list[float],
+    debug_dir: Path | None,
+    tess_timeout: int | None,
+    threads: int,
 ) -> tuple[list[dict], dict[str, int]]:
-    print(f"Converting PDF → images @ {dpi} DPI...")
-    images = convert_from_path(str(pdf_path), dpi=dpi)
-    print(f"→ {len(images)} page(s)")
 
-    variants = [
-        {"name": "gray",   "thresh": "none", "inv": False, "scale": 1.0, "blur": 0, "denoise": False, "morph_close": False, "dot_ref": True,  "line_clean": False, "line_mask": True},
-        {"name": "gray2x", "thresh": "none", "inv": False, "scale": 2.0, "blur": 0, "denoise": False, "morph_close": False, "dot_ref": True,  "line_clean": False, "line_mask": True},
-        {"name": "otsu0",  "thresh": "otsu", "inv": False, "scale": 1.0, "blur": 0, "denoise": False, "morph_close": False, "dot_ref": True,  "line_clean": False, "line_mask": True},
+    prof = quality_profile(quality)
 
-        {"name": "ag0",    "thresh": "adaptive_gauss","inv": False, "scale": 1.0, "blur": 0, "denoise": False, "morph_close": False, "dot_ref": False, "line_clean": False, "line_mask": True},
-        {"name": "ag_s1",  "thresh": "adaptive_gauss","inv": False, "scale": 1.0, "blur": 3, "denoise": False, "morph_close": False, "dot_ref": False, "line_clean": False, "line_mask": True},
-        {"name": "ag_inv", "thresh": "adaptive_gauss","inv": True,  "scale": 1.0, "blur": 3, "denoise": True,  "morph_close": False, "dot_ref": False, "line_clean": False, "line_mask": True},
-        {"name": "am_s1",  "thresh": "adaptive_mean", "inv": False, "scale": 1.0, "blur": 3, "denoise": False, "morph_close": False, "dot_ref": False, "line_clean": False, "line_mask": True},
-        {"name": "otsu2x", "thresh": "otsu",          "inv": False, "scale": 2.0, "blur": 3, "denoise": False, "morph_close": True,  "dot_ref": False, "line_clean": False, "line_mask": True},
-        {"name": "ag2x",   "thresh": "adaptive_gauss","inv": False, "scale": 2.0, "blur": 3, "denoise": True,  "morph_close": True,  "dot_ref": False, "line_clean": False, "line_mask": True},
-    ]
+    dpi_list = dpi_list if dpi_list else prof["dpi_list"]
+    angles = angles if angles else prof["angles"]
+    fallback_tile_angles = fallback_tile_angles if fallback_tile_angles else prof["fallback_tile_angles"]
+    callout_angles = callout_angles if callout_angles else prof["callout_angles"]
+    roi_pad = roi_pad if roi_pad is not None else prof["roi_pad"]
+    max_rois = max_rois if max_rois is not None else prof["max_rois"]
+    dist_tol = dist_tol if dist_tol is not None else prof["dist_tol"]
+    bear_tol_deg = bear_tol_deg if bear_tol_deg is not None else prof["bear_tol_deg"]
+    min_support = min_support if min_support is not None else prof["min_support"]
 
-    if enable_lineclean:
-        variants += [
-            {"name": "lc_gray2x", "thresh": "none", "inv": False, "scale": 2.0, "blur": 0, "denoise": False, "morph_close": False,
-             "dot_ref": False, "line_clean": True, "inpaint_radius": LINE_INPAINT_RADIUS, "line_mask": True},
-            {"name": "lc_otsu2x", "thresh": "otsu", "inv": False, "scale": 2.0, "blur": 3, "denoise": False, "morph_close": True,
-             "dot_ref": False, "line_clean": True, "inpaint_radius": LINE_INPAINT_RADIUS, "line_mask": True},
-            {"name": "lc_ag2x", "thresh": "adaptive_gauss", "inv": False, "scale": 2.0, "blur": 3, "denoise": True, "morph_close": True,
-             "dot_ref": False, "line_clean": True, "inpaint_radius": LINE_INPAINT_RADIUS, "line_mask": True},
-        ]
+    if debug_dir:
+        debug_dir.mkdir(parents=True, exist_ok=True)
 
-    # IMPORTANT: do NOT include quote characters in whitelist (shlex will explode).
-    # We reconstruct bearings without relying on minute/second quote glyphs.
     whitelist = "0123456789NSEWnsewLClc.,-°oº()"
-    common = f"-c preserve_interword_spaces=1 -c classify_bln_numeric_mode=1 -c tessedit_enable_dict_correction=0 -c tessedit_char_whitelist={whitelist}"
+    common = (
+        f"-c preserve_interword_spaces=1 "
+        f"-c classify_bln_numeric_mode=1 "
+        f"-c tessedit_enable_dict_correction=0 "
+        f"-c load_system_dawg=0 -c load_freq_dawg=0 "
+        f"-c user_defined_dpi=600 "
+        f"-c tessedit_char_whitelist={whitelist}"
+    )
 
     ocr_configs = [
         (f'--oem 3 --psm 6  {common}', "block"),
@@ -1379,126 +1579,96 @@ def extract_pairs_from_pdf(
         (f'--oem 3 --psm 7  {common}', "single_line"),
         (f'--oem 3 --psm 13 {common}', "raw_line"),
         (f'--oem 1 --psm 11 {common}', "legacy_sparse"),
+        (f'--oem 1 --psm 6  {common}', "legacy_block"),
     ]
 
     table_configs = [
         (f'--oem 3 --psm 6  {common}', "table_block"),
         (f'--oem 3 --psm 4  {common}', "table_columns"),
         (f'--oem 3 --psm 11 {common}', "table_sparse"),
+        (f'--oem 1 --psm 6  {common}', "table_legacy"),
     ]
+
+    variants = [
+        {"name": "gray",   "thresh": "none", "inv": False, "scale": 1.0, "blur": 0, "denoise": False, "morph_close": False, "dot_ref": True,  "line_clean": False, "line_mask": True},
+        {"name": "gray2x", "thresh": "none", "inv": False, "scale": 2.0, "blur": 0, "denoise": False, "morph_close": False, "dot_ref": True,  "line_clean": False, "line_mask": True},
+        {"name": "clahe2x","thresh": "none", "inv": False, "scale": 2.0, "blur": 0, "denoise": False, "morph_close": False, "dot_ref": True,  "line_clean": False, "line_mask": True,
+         "clahe": True, "clahe_clip": 2.2, "clahe_grid": 8},
+
+        {"name": "otsu2x", "thresh": "otsu", "inv": False, "scale": 2.0, "blur": 3, "denoise": False, "morph_close": True, "dot_ref": False, "line_clean": False, "line_mask": True},
+        {"name": "otsu2x_inv","thresh": "otsu", "inv": True, "scale": 2.0, "blur": 3, "denoise": False, "morph_close": True, "dot_ref": False, "line_clean": False, "line_mask": True},
+
+        {"name": "ag2x_b31_c10","thresh": "adaptive_gauss","inv": False, "scale": 2.0, "blur": 3, "denoise": True, "morph_close": True, "dot_ref": False, "line_clean": False, "line_mask": True, "block_size": 31, "C": 10},
+        {"name": "ag2x_b41_c10","thresh": "adaptive_gauss","inv": False, "scale": 2.0, "blur": 3, "denoise": True, "morph_close": True, "dot_ref": False, "line_clean": False, "line_mask": True, "block_size": 41, "C": 10},
+        {"name": "ag2x_b51_c12","thresh": "adaptive_gauss","inv": False, "scale": 2.0, "blur": 3, "denoise": True, "morph_close": True, "dot_ref": False, "line_clean": False, "line_mask": True, "block_size": 51, "C": 12},
+        {"name": "am2x_b41_c10","thresh": "adaptive_mean", "inv": False, "scale": 2.0, "blur": 3, "denoise": True, "morph_close": True, "dot_ref": False, "line_clean": False, "line_mask": True, "block_size": 41, "C": 10},
+    ]
+
+    if enable_lineclean:
+        for r in LINE_INPAINT_RADII:
+            variants += [
+                {"name": f"lc_gray2x_r{r}", "thresh": "none", "inv": False, "scale": 2.0, "blur": 0, "denoise": False, "morph_close": False,
+                 "dot_ref": False, "line_clean": True, "inpaint_radius": r, "line_mask": True},
+                {"name": f"lc_otsu2x_r{r}", "thresh": "otsu", "inv": False, "scale": 2.0, "blur": 3, "denoise": False, "morph_close": True,
+                 "dot_ref": False, "line_clean": True, "inpaint_radius": r, "line_mask": True},
+                {"name": f"lc_ag2x_b41_c10_r{r}", "thresh": "adaptive_gauss", "inv": False, "scale": 2.0, "blur": 3, "denoise": True, "morph_close": True,
+                 "dot_ref": False, "line_clean": True, "inpaint_radius": r, "line_mask": True, "block_size": 41, "C": 10},
+            ]
+
+    info = pdfinfo_from_path(str(pdf_path))
+    page_count = int(info.get("Pages", 1))
 
     all_candidates: list[dict] = []
     table_candidates: list[dict] = []
-
-    if debug_dir:
-        debug_dir.mkdir(parents=True, exist_ok=True)
-
     global_callouts = defaultdict(int)
 
-    for page_idx, page_img in enumerate(images, 1):
-        print(f"  Page {page_idx}...")
+    threads = int(threads) if int(threads) > 0 else 1
 
-        callouts = scan_label_callouts(page_img, callout_angles)
-        for k, v in callouts.items():
-            global_callouts[k] += v
+    print(f"PDF pages: {page_count}")
+    print(f"Quality={quality}  dpi_list={dpi_list}")
+    print(f"Angles={len(angles)} rotations  fallback_tile_angles={len(fallback_tile_angles)}  callout_angles={len(callout_angles)}")
+    print(f"Variants={len(variants)}  OCR configs={len(ocr_configs)}  Table configs={len(table_configs)}")
+    print(f"Parallel angle threads={threads}")
 
-        for angle in angles:
-            rot_img = rotate_keep_size(page_img, angle)
-            W, H = rot_img.size
+    for page_idx in range(1, page_count + 1):
+        print(f"\n=== Page {page_idx}/{page_count} ===")
 
-            rois = detect_bearing_distance_rois(rot_img, roi_pad=roi_pad, max_rois=max_rois)
+        for dpi in dpi_list:
+            print(f"  Render @ {dpi} DPI...")
+            imgs = convert_from_path(str(pdf_path), dpi=int(dpi), first_page=page_idx, last_page=page_idx)
+            if not imgs:
+                continue
+            page_img = imgs[0]
 
-            tiled_mode = False
-            if rois:
-                print(f"    angle {angle:+.0f}°: ROI detect {len(rois)}")
-            else:
-                if float(angle) in fallback_tile_angles:
-                    tiled_mode = True
-                    print(f"    angle {angle:+.0f}°: ROI detect none → tiling full page")
-                    rois = tile_rect((0, 0, W, H), W, H, max_pixels=MAX_ROI_PIXELS, overlap=160)
-                else:
-                    rois = []
+            callouts = scan_label_callouts(page_img, callout_angles, tess_timeout=tess_timeout)
+            for k, v in callouts.items():
+                global_callouts[k] += v
 
-            roi_counter = 0
-            for r in rois:
-                tiles = tile_rect(r, W, H, max_pixels=MAX_ROI_PIXELS, overlap=140)
-                for tr in tiles:
-                    roi_counter += 1
-                    x1, y1, x2, y2 = tr
-                    crop = rot_img.crop((x1, y1, x2, y2))
+            # Parallelize per-angle processing
+            futures = []
+            with ThreadPoolExecutor(max_workers=threads) as ex:
+                for angle in angles:
+                    futures.append(ex.submit(
+                        _process_one_angle,
+                        page_img, page_idx, int(dpi), float(angle),
+                        fallback_tile_angles, int(roi_pad), int(max_rois),
+                        bool(enable_tables), debug_dir,
+                        ocr_configs, table_configs, variants, tess_timeout
+                    ))
 
-                    if debug_dir:
-                        crop_path = debug_dir / f"page{page_idx:02d}_a{int(angle):+03d}_roi{roi_counter:03d}_{x1}_{y1}_{x2}_{y2}.png"
-                        try:
-                            crop.save(crop_path)
-                        except Exception:
-                            pass
+                for fut in as_completed(futures):
+                    roi_cands, tbl_cands = fut.result()
+                    all_candidates.extend(roi_cands)
+                    table_candidates.extend(tbl_cands)
 
-                    cands = multipass_ocr_on_roi(crop, ocr_configs=ocr_configs, variants=variants, require_label=False)
-
-                    for c in cands:
-                        c["page"] = page_idx
-                        c["angle"] = float(angle)
-                        c["roi"] = roi_counter
-                        c["roi_bbox"] = (x1, y1, x2, y2)
-                        c["table_kind"] = None
-                        c["source"] = "roi"
-
-                        if tiled_mode:
-                            roi_cy = (y1 + y2) / 2.0
-                            if roi_cy <= HEADER_FOOTER_STRIP_FRAC * H or roi_cy >= (1.0 - HEADER_FOOTER_STRIP_FRAC) * H:
-                                c["_rejected_header_footer"] = True
-                            else:
-                                c["_rejected_header_footer"] = False
-                        else:
-                            c["_rejected_header_footer"] = False
-
-                    cands = [c for c in cands if not c.get("_rejected_header_footer")]
-                    all_candidates.extend(cands)
-
-            if enable_tables:
-                table_rois = detect_table_rois(rot_img, max_tables=6)
-                if table_rois:
-                    print(f"    angle {angle:+.0f}°: table detect {len(table_rois)}")
-                for tkind, tr in table_rois:
-                    tx1, ty1, tx2, ty2 = tr
-                    tcrop = rot_img.crop((tx1, ty1, tx2, ty2))
-
-                    require_label = True
-                    cands = multipass_ocr_on_roi(tcrop, ocr_configs=table_configs, variants=variants, require_label=require_label)
-
-                    for c in cands:
-                        rid = c.get("ref_id")
-                        if not rid:
-                            continue
-                        if tkind == "line_table" and not rid.startswith("L"):
-                            continue
-                        if tkind == "curve_table" and not rid.startswith("C"):
-                            continue
-
-                        raw = (c.get("raw_line") or "")
-                        c["curve_hint"] = bool(CURVE_HINT_RE.search(raw))
-
-                        c["page"] = page_idx
-                        c["angle"] = float(angle)
-                        c["roi"] = "table"
-                        c["roi_bbox"] = (tx1, ty1, tx2, ty2)
-                        c["table_kind"] = tkind
-                        c["source"] = "table_roi"
-
-                        table_candidates.append(c)
-
-        print(f"    Candidates so far: callouts={len(all_candidates)}  tables={len(table_candidates)}")
-
-    if not all_candidates and not table_candidates:
-        return [], dict(global_callouts)
+            print(f"  candidates so far: roi={len(all_candidates)} table={len(table_candidates)} callouts={len(global_callouts)}")
 
     winners = []
 
     if all_candidates:
-        clusters = cluster_candidates(all_candidates, dist_tol=dist_tol, bear_tol_deg=bear_tol_deg)
+        clusters = cluster_candidates(all_candidates, dist_tol=float(dist_tol), bear_tol_deg=float(bear_tol_deg))
         w = [pick_cluster_winner(cl) for cl in clusters]
-        winners.extend([x for x in w if x.get("support", 1) >= min_support])
+        winners.extend([x for x in w if x.get("support", 1) >= int(min_support)])
 
     if table_candidates:
         groups = defaultdict(list)
@@ -1508,26 +1678,23 @@ def extract_pairs_from_pdf(
         for (tkind, rid), cands in groups.items():
             if not cands:
                 continue
-
-            clusters = cluster_candidates(cands, dist_tol=dist_tol, bear_tol_deg=bear_tol_deg)
+            clusters = cluster_candidates(cands, dist_tol=float(dist_tol), bear_tol_deg=float(bear_tol_deg))
             cluster_winners = [pick_cluster_winner(cl) for cl in clusters]
             cluster_winners.sort(key=lambda x: (x.get("support", 1), x.get("vote_score", -1e9), x.get("best_conf", -1)), reverse=True)
             best = cluster_winners[0]
-
             best["ref_id"] = rid
             best["table_kind"] = tkind
             best["source"] = "voted_table"
-
-            if best.get("support", 1) >= min_support:
+            if best.get("support", 1) >= int(min_support):
                 winners.append(best)
 
     best_map: dict[tuple[str, str, str | None, str | None], dict] = {}
     for w in winners:
         k = (w.get("bearing"), w.get("distance"), w.get("ref_id"), w.get("table_kind"))
-        if k not in best_map:
+        prev = best_map.get(k)
+        if prev is None:
             best_map[k] = w
         else:
-            prev = best_map[k]
             if (w.get("support", 1), w.get("vote_score", -1e9), w.get("best_conf", -1)) > (prev.get("support", 1), prev.get("vote_score", -1e9), prev.get("best_conf", -1)):
                 best_map[k] = w
 
@@ -1535,43 +1702,14 @@ def extract_pairs_from_pdf(
 
     for r in out:
         rid = r.get("ref_id")
-        if rid:
-            r["callout_count"] = int(global_callouts.get(rid, 0))
-        else:
-            r["callout_count"] = 0
+        r["callout_count"] = int(global_callouts.get(rid, 0)) if rid else 0
 
     out.sort(key=lambda x: x.get("numeric_dist", 0), reverse=True)
     return out, dict(global_callouts)
 
 # ---------------------------
-# CLI helpers
+# Output helpers
 # ---------------------------
-
-def parse_angles(s: str) -> list[float]:
-    s = (s or "").strip()
-    if not s or s.lower() in ("auto", "default"):
-        return DEFAULT_ANGLES[:]
-    out = []
-    for part in s.split(","):
-        part = part.strip()
-        if not part:
-            continue
-        try:
-            out.append(float(part))
-        except ValueError:
-            pass
-    if not out:
-        return DEFAULT_ANGLES[:]
-    if not any(abs(a) < 1e-9 for a in out):
-        out.append(0.0)
-    seen = set()
-    uniq = []
-    for a in out:
-        key = round(float(a), 6)
-        if key not in seen:
-            seen.add(key)
-            uniq.append(float(a))
-    return uniq
 
 def fmt_pair_line(p: dict) -> str:
     rid = p.get("ref_id")
@@ -1582,56 +1720,85 @@ def fmt_pair_line(p: dict) -> str:
     return f"{prefix}{p['bearing']:22}  {p['distance']:>9} ft"
 
 # ---------------------------
-# Main
+# CLI
 # ---------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="Extract bearings & distances from ROS PDF (multi-angle ROI + multipass vote + linework cleanup + line/curve tables)")
+    parser = argparse.ArgumentParser(description="Extract bearings & distances from ROS PDF (MAX quality available)")
     parser.add_argument("file", help="Path to PDF")
-    parser.add_argument("--dpi", type=int, default=500, help="Higher = better symbol recognition (watch file size)")
-    parser.add_argument("--roi-pad", type=int, default=55, help="Padding pixels around detected bearing/distance lines")
-    parser.add_argument("--max-rois", type=int, default=35, help="Cap number of ROIs per angle per page")
-    parser.add_argument("--min-support", type=int, default=2, help="Require at least N agreeing passes for a result")
-    parser.add_argument("--dist-tol", type=float, default=0.25, help="Clustering tolerance in feet for measured distances")
-    parser.add_argument("--bear-tol-deg", type=float, default=0.35, help="Clustering tolerance in degrees for bearings")
-    parser.add_argument("--angles", default="default",
-                        help="Comma-separated angles in degrees to scan (e.g. \"-90,-45,0,45,90\"). Use 'default' for built-in sweep.")
-    parser.add_argument("--fallback-tile-angles", default="0,-90,90,180",
-                        help="Angles where we brute-force tile the whole page if ROI detection finds nothing.")
-    parser.add_argument("--callout-angles", default="0,-90,90",
-                        help="Angles to scan for L#/C# callouts (fewer is faster).")
-    parser.add_argument("--debug-rois", help="Directory to save detected ROI crops")
+
+    parser.add_argument("--quality", choices=["fast", "balanced", "max"], default="max",
+                        help="Quality preset. 'max' is hours-OK exhaustive mode (default).")
+
+    parser.add_argument("--threads", type=int, default=16,
+                        help="Thread pool size for parallel angle processing (default 16).")
+
+    parser.add_argument("--omp-thread-limit", type=int, default=None,
+                        help="Set OMP_THREAD_LIMIT (recommended 1 when using many threads). If not set and --threads>1, defaults to 1 unless already defined in env.")
+
+    parser.add_argument("--dpi-list", default="",
+                        help="Override DPI list (comma-separated), e.g. 500,650,800")
+    parser.add_argument("--angles", default="",
+                        help="Override angles list (comma-separated degrees). Empty uses quality preset.")
+    parser.add_argument("--fallback-tile-angles", default="",
+                        help="Override fallback tile angles list (comma-separated). Empty uses preset.")
+    parser.add_argument("--callout-angles", default="",
+                        help="Override callout angles list (comma-separated). Empty uses preset.")
+
+    parser.add_argument("--roi-pad", type=int, default=None)
+    parser.add_argument("--max-rois", type=int, default=None)
+    parser.add_argument("--min-support", type=int, default=None)
+    parser.add_argument("--dist-tol", type=float, default=None)
+    parser.add_argument("--bear-tol-deg", type=float, default=None)
+
+    parser.add_argument("--debug-rois", help="Directory to save ROI crops")
     parser.add_argument("--no-forced", action="store_true", help="Disable forced matches")
     parser.add_argument("--no-lineclean", action="store_true", help="Disable linework inpaint passes")
     parser.add_argument("--no-tables", action="store_true", help="Disable line/curve table extraction")
+
+    parser.add_argument("--tess-timeout", type=int, default=0,
+                        help="Per-Tesseract call timeout seconds (0 disables). Use 0 for max quality.")
     parser.add_argument("--verbose", "-v", action="store_true")
     parser.add_argument("--output", "-o", help="Save as JSON")
     args = parser.parse_args()
+
+    # Avoid oversubscription: many concurrent tesseracts can each spin up multiple OpenMP threads.
+    if args.omp_thread_limit is not None:
+        os.environ["OMP_THREAD_LIMIT"] = str(int(args.omp_thread_limit))
+    else:
+        if int(args.threads) > 1 and "OMP_THREAD_LIMIT" not in os.environ:
+            os.environ["OMP_THREAD_LIMIT"] = "1"
 
     pdf = Path(args.file)
     if not pdf.is_file():
         print("File not found.")
         sys.exit(1)
 
+    dpi_list = [int(x) for x in parse_float_list(args.dpi_list)] if args.dpi_list.strip() else None
+    angles = parse_float_list(args.angles) if args.angles.strip() else None
+    fallback_tile_angles = set(parse_float_list(args.fallback_tile_angles)) if args.fallback_tile_angles.strip() else None
+    callout_angles = parse_float_list(args.callout_angles) if args.callout_angles.strip() else None
+
     debug_dir = Path(args.debug_rois) if args.debug_rois else None
-    angles = parse_angles(args.angles)
-    fallback_tile_angles = set(float(a) for a in parse_angles(args.fallback_tile_angles))
-    callout_angles = parse_angles(args.callout_angles)
+    tess_timeout = int(args.tess_timeout) if int(args.tess_timeout) > 0 else None
 
     pairs, callouts = extract_pairs_from_pdf(
         pdf_path=pdf,
-        dpi=args.dpi,
+        quality=args.quality,
+        dpi_list=dpi_list,
+        angles=angles,
+        fallback_tile_angles=fallback_tile_angles,
+        callout_angles=callout_angles,
         roi_pad=args.roi_pad,
         max_rois=args.max_rois,
         dist_tol=args.dist_tol,
         bear_tol_deg=args.bear_tol_deg,
         min_support=args.min_support,
-        debug_dir=debug_dir,
-        angles=angles,
-        fallback_tile_angles=fallback_tile_angles,
         enable_lineclean=not args.no_lineclean,
         enable_tables=not args.no_tables,
-        callout_angles=callout_angles,
+        debug_dir=debug_dir,
+        tess_timeout=tess_timeout,
+        threads=int(args.threads),
     )
 
     if not args.no_forced:
@@ -1647,9 +1814,9 @@ def main():
     uniq.sort(key=lambda x: x.get("numeric_dist", 0), reverse=True)
     pairs = uniq
 
-    print("\n" + "=" * 90)
-    print("EXTRACTED BEARING → MEASURED DISTANCE (RECORD)  +  LINE/CURVE TABLE ROWS (L#/C#)")
-    print("=" * 90)
+    print("\n" + "=" * 92)
+    print("EXTRACTED BEARING → MEASURED DISTANCE (RECORD)   +   LINE/CURVE TABLE ROWS (L#/C#)")
+    print("=" * 92)
 
     if not pairs:
         print("No valid pairs found.")
@@ -1665,26 +1832,30 @@ def main():
         tk_s = f", {tk}" if tk else ""
         rid = p.get("ref_id")
         rid_s = f"{rid} " if rid else ""
-        print(f"{i:2d}. {rid_s}{fmt_pair_line(p)}   (support={support}, conf={conf:.1f}, overlap={ov:.2f}, callouts={cc}, {src}{tk_s})")
+        print(f"{i:3d}. {rid_s}{fmt_pair_line(p)}   (support={support}, conf={conf:.1f}, overlap={ov:.2f}, callouts={cc}, {src}{tk_s})")
 
         if args.verbose:
             ex = (p.get("example_raw") or "").replace("\n", " ").strip()
-            if len(ex) > 240:
-                ex = ex[:240] + "..."
+            if len(ex) > 260:
+                ex = ex[:260] + "..."
             if ex:
-                print(f"   Example OCR: {ex}")
+                print(f"     Example OCR: {ex}")
 
             if p.get("dist_quality_votes"):
                 dqs = ", ".join([f"{x['quality']}×{x['count']}" for x in p["dist_quality_votes"]])
-                print(f"   Meas evidence: {dqs}")
+                print(f"     Meas evidence: {dqs}")
 
             if p.get("record_quality_votes"):
                 rqs = ", ".join([f"{x['quality']}×{x['count']}" for x in p["record_quality_votes"]])
-                print(f"   Rec evidence:  {rqs}")
+                print(f"     Rec evidence:  {rqs}")
 
             if p.get("angle_votes"):
                 top_angles = ", ".join([f"{x['angle']:+.0f}°×{x['count']}" for x in p["angle_votes"]])
-                print(f"   Angle votes:   {top_angles}")
+                print(f"     Angle votes:   {top_angles}")
+
+            if p.get("dpi_votes"):
+                top_dpis = ", ".join([f"{x['dpi']}×{x['count']}" for x in p["dpi_votes"]])
+                print(f"     DPI votes:     {top_dpis}")
             print()
 
     print(f"\nTotal unique pairs: {len(pairs)}")
@@ -1698,7 +1869,7 @@ def main():
                 continue
             print(f"  {k}: {v}")
             shown += 1
-            if shown >= 40:
+            if shown >= 60:
                 print("  ...")
                 break
 
@@ -1706,9 +1877,9 @@ def main():
         with open(args.output, "w") as f:
             json.dump({
                 "file": str(pdf),
-                "angles": angles,
-                "callout_angles": callout_angles,
-                "callouts": callouts,
+                "quality": args.quality,
+                "threads": int(args.threads),
+                "omp_thread_limit": os.environ.get("OMP_THREAD_LIMIT"),
                 "pairs": [
                     {
                         "ref_id": p.get("ref_id"),
@@ -1724,11 +1895,14 @@ def main():
                         "vote_score": p.get("vote_score"),
                         "dist_quality_votes": p.get("dist_quality_votes", []),
                         "record_quality_votes": p.get("record_quality_votes", []),
+                        "angle_votes": p.get("angle_votes", []),
+                        "dpi_votes": p.get("dpi_votes", []),
                         "example_raw": p.get("example_raw", ""),
                     }
                     for p in pairs
                 ],
-                "count": len(pairs)
+                "count": len(pairs),
+                "callouts": callouts
             }, f, indent=2)
         print(f"\nResults saved to {args.output}")
 
