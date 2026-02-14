@@ -2,10 +2,16 @@
 """
 OCR script to extract bearings and distances from Record of Survey PDFs.
 
-Adds (on top of the prior multi-angle / ROI / multipass voter / linework cleanup / record-distance support):
-- Line Table extraction (L1, L2, ... with bearing + distance)
-- Curve Table extraction (C1, C2, ... with chord bearing + chord distance, plus optional radius/delta/arc if present)
-- Callout scan for L# / C# references in the drawing so you can match "L1" notes to table rows
+Adds:
+- Multi-angle scan
+- ROI detect + fallback tiling
+- Multi-pass OCR voting
+- Linework detection + inpaint cleanup
+- Decimal-dot pixel evidence (no "digit length" guessing)
+- Filters for acres/dates/titleblock-ish noise
+- Record distance capture: 123.45 (124)
+- Line Table extraction (L1, L2...) + Curve Table extraction (C1, C2...)
+- Callout scan for L#/C# references
 
 Install:
   pip install pytesseract pdf2image Pillow opencv-python-headless numpy
@@ -773,7 +779,8 @@ def detect_table_rois(page_img: Image.Image, max_tables: int = 6) -> list[tuple[
                                cv2.THRESH_BINARY, 41, 11)
     pil = Image.fromarray(bw)
 
-    whitelist = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789()°'\".,-"
+    # IMPORTANT: do NOT include quote characters in whitelist (shlex will explode).
+    whitelist = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789()°.,-"
     cfg = f'--oem 3 --psm 6 -c preserve_interword_spaces=1 -c tessedit_char_whitelist={whitelist}'
     data = pytesseract.image_to_data(pil, config=cfg, lang="eng", output_type=Output.DICT)
 
@@ -802,14 +809,12 @@ def detect_table_rois(page_img: Image.Image, max_tables: int = 6) -> list[tuple[
     if not hits:
         return []
 
-    # Build clusters by proximity (header zones)
     clusters = []
     for kw, conf, bb in hits:
-        placed = False
         cx = (bb[0] + bb[2]) / 2.0
         cy = (bb[1] + bb[3]) / 2.0
+        placed = False
         for cl in clusters:
-            # proximity in small-image space
             if abs(cx - cl["cx"]) < 260 and abs(cy - cl["cy"]) < 160:
                 cl["items"].append((kw, conf, bb))
                 cl["cx"] = (cl["cx"] * 0.7 + cx * 0.3)
@@ -823,29 +828,24 @@ def detect_table_rois(page_img: Image.Image, max_tables: int = 6) -> list[tuple[
     for cl in clusters:
         kws = {k for (k, _, _) in cl["items"]}
         kind = None
-        # Determine kind by keyword mix
         if "table" in kws and "line" in kws and ("bearing" in kws or "distance" in kws):
             kind = "line_table"
         elif "table" in kws and "curve" in kws and ("chord" in kws or "radius" in kws or "delta" in kws):
             kind = "curve_table"
         else:
-            # weaker signals:
             if "line" in kws and "bearing" in kws and "distance" in kws:
                 kind = "line_table"
             elif "curve" in kws and ("chord" in kws or "radius" in kws) and ("distance" in kws or "length" in kws):
                 kind = "curve_table"
-
         if not kind:
             continue
 
-        # Bounding box of header keywords
         xs = [bb[0] for (_, _, bb) in cl["items"]]
         ys = [bb[1] for (_, _, bb) in cl["items"]]
         xe = [bb[2] for (_, _, bb) in cl["items"]]
         ye = [bb[3] for (_, _, bb) in cl["items"]]
         x1 = min(xs); y1 = min(ys); x2 = max(xe); y2 = max(ye)
 
-        # Expand to cover table rows (downwards)
         header_h = max(12, y2 - y1)
         pad_x = int(0.16 * sW)
         pad_y = int(0.05 * sH)
@@ -853,10 +853,8 @@ def detect_table_rois(page_img: Image.Image, max_tables: int = 6) -> list[tuple[
         x1 = max(0, x1 - pad_x)
         x2 = min(sW, x2 + pad_x)
         y1 = max(0, y1 - pad_y)
-        # expand down: either 35% page height or 16*header_h
         y2 = min(sH, y2 + max(int(0.35 * sH), 16 * header_h))
 
-        # Scale back to original coords
         if scale != 1.0:
             ox1 = int(x1 / scale)
             oy1 = int(y1 / scale)
@@ -868,11 +866,9 @@ def detect_table_rois(page_img: Image.Image, max_tables: int = 6) -> list[tuple[
         r = clamp_rect((ox1, oy1, ox2, oy2), W, H)
         out.append((kind, r))
 
-    # Dedup tables by intersection/merge, keep kind by majority
     if not out:
         return []
 
-    # merge per kind first
     by_kind = defaultdict(list)
     for k, r in out:
         by_kind[k].append(r)
@@ -883,7 +879,6 @@ def detect_table_rois(page_img: Image.Image, max_tables: int = 6) -> list[tuple[
         for r in rects:
             merged.append((k, r))
 
-    # limit
     merged.sort(key=lambda kr: (kr[1][3] - kr[1][1]) * (kr[1][2] - kr[1][0]), reverse=True)
     return merged[:max_tables]
 
@@ -964,7 +959,6 @@ def parse_record_distance_from_following(
 # ---------------------------
 
 def find_label_in_words(words: list[dict]) -> str | None:
-    # Prefer earliest explicit label token
     for w in words:
         t = (w.get("text") or "").strip()
         if not t:
@@ -979,7 +973,6 @@ def find_label_in_words(words: list[dict]) -> str | None:
             c = canon_label(m.group(0))
             if c:
                 return c
-    # Also check joined line (some OCR splits)
     joined = " ".join((w.get("text") or "") for w in words)
     m = LINE_ID_RE.search(joined)
     if m:
@@ -1001,15 +994,6 @@ def extract_pairs_from_line_words(
     min_ft: float = 1.0,
     require_label: bool = False,
 ) -> list[dict]:
-    """
-    Returns list of dict candidates:
-      {
-        canon_bearing, numeric_dist, distance(str),
-        dist_quality, dist_raw, dist_bbox, line_overlap,
-        record_distance, record_numeric_dist, record_quality,
-        ref_id(optional)
-      }
-    """
     out = []
     if not line_words:
         return out
@@ -1044,7 +1028,6 @@ def extract_pairs_from_line_words(
                 if re.search(r"[A-Za-z]", tok):
                     continue
 
-                # Skip paren-only tokens as measured
                 if "(" in tok or ")" in tok:
                     if "(" in tok and re.search(r"^\(?\d", tok):
                         if "." in tok or "·" in tok or "•" in tok or "∙" in tok or "⋅" in tok:
@@ -1062,7 +1045,6 @@ def extract_pairs_from_line_words(
             meas_raw = texts[dist_idx]
             meas_bbox = line_words[dist_idx]["bbox"]
 
-            # area-unit rejection
             if has_area_unit_near(line_words, dist_idx, window=4):
                 break
 
@@ -1082,7 +1064,6 @@ def extract_pairs_from_line_words(
 
             rec_val, rec_str, rec_quality = parse_record_distance_from_following(line_words, dist_idx, dot_ref_img)
 
-            # Format measured distance: keep 3 decimals when dot evidence, else 2
             meas_str = f"{meas_val:.3f}".rstrip("0").rstrip(".") if meas_quality == "dot_blob" else f"{meas_val:.2f}"
 
             out.append({
@@ -1147,73 +1128,6 @@ def multipass_ocr_on_roi(roi_img: Image.Image, ocr_configs: list[tuple[str, str]
                     }
                     candidates.append(cand)
     return candidates
-
-# ---------------------------
-# Table-specific extraction helpers
-# ---------------------------
-
-def parse_curve_row_params(words: list[dict], dot_ref_img: Image.Image | None) -> dict:
-    """
-    Best-effort parse for curve table params from a row:
-      radius, delta (deg/min/sec), arc length / length (ft)
-    Keeps conservative: only returns values when confident tokens exist.
-    """
-    txt = " ".join((w.get("text") or "") for w in words)
-    out = {}
-
-    # radius: look for R= or "R" near a number, or a number under "RADIUS" column
-    # We'll just scan for "R" token and next numeric token
-    tokens = [(w.get("text") or "").strip() for w in words]
-    for i, t in enumerate(tokens):
-        tl = t.lower().replace(":", "")
-        if tl in ("r", "rad", "radius", "r=") or tl.startswith("r="):
-            # get numeric in same token after '='
-            if "=" in t:
-                after = t.split("=", 1)[1]
-                v, q = parse_distance_with_quality(after, None, min_ft=0.0, max_ft=10_000_000.0)
-                if v is not None:
-                    out["radius"] = float(v)
-                    out["radius_quality"] = q
-                    break
-            # else next numeric
-            for j in range(i + 1, min(len(tokens), i + 5)):
-                if re.search(r"\d", tokens[j]) and not re.search(r"[A-Za-z]", tokens[j]):
-                    bb = words[j]["bbox"]
-                    dd = detect_decimal_dot_digits_right(dot_ref_img, bb) if dot_ref_img is not None else None
-                    v, q = parse_distance_with_quality(tokens[j], dd, min_ft=0.0, max_ft=10_000_000.0)
-                    if v is not None:
-                        out["radius"] = float(v)
-                        out["radius_quality"] = q
-                        break
-            if "radius" in out:
-                break
-
-    # delta: often written Δ=12°34'56" or "DELTA 12°34'56""
-    m = re.search(r"(?i)(?:delta|Δ)\s*=?\s*([0-9OolIDSBZ|]{1,3})\s*[°oº]\s*([0-9OolIDSBZ|]{1,2})\s*['’]\s*([0-9OolIDSBZ|]{1,2})", txt)
-    if m:
-        d = int(_clean_digits(m.group(1)))
-        mi = int(_clean_digits(m.group(2)))
-        se = int(_clean_digits(m.group(3)))
-        if 0 <= d <= 360 and 0 <= mi < 60 and 0 <= se < 60:
-            out["delta"] = f"{d:02d}°{mi:02d}'{se:02d}\""
-
-    # length: look for "L" or "LEN" or "LENGTH" token near numeric
-    for i, t in enumerate(tokens):
-        tl = t.lower().replace(":", "")
-        if tl in ("l", "len", "length", "arc", "arclen", "arc-length", "arclength"):
-            for j in range(i + 1, min(len(tokens), i + 6)):
-                if re.search(r"\d", tokens[j]) and not re.search(r"[A-Za-z]", tokens[j]):
-                    bb = words[j]["bbox"]
-                    dd = detect_decimal_dot_digits_right(dot_ref_img, bb) if dot_ref_img is not None else None
-                    v, q = parse_distance_with_quality(tokens[j], dd, min_ft=0.0, max_ft=10_000_000.0)
-                    if v is not None:
-                        out["arc_length"] = float(v)
-                        out["arc_length_quality"] = q
-                        break
-            if "arc_length" in out:
-                break
-
-    return out
 
 # ---------------------------
 # Candidate clustering / voting
@@ -1288,7 +1202,6 @@ def pick_cluster_winner(cluster: list[dict]) -> dict:
     bearing, dist_str = best_key
     dist_val = float(dist_str)
 
-    # Record distance voting (optional)
     rec_counts = Counter((c.get("record_distance") or None) for c in reps)
     rec_choice = None
     if rec_counts:
@@ -1342,10 +1255,6 @@ def pick_cluster_winner(cluster: list[dict]) -> dict:
 # ---------------------------
 
 def scan_label_callouts(page_img: Image.Image, angles: list[float]) -> dict[str, int]:
-    """
-    Scan the page for L1/L2/... and C1/C2/... occurrences.
-    Counts unique occurrences per label using coarse bbox bucketing.
-    """
     counts = defaultdict(set)
 
     whitelist = "LC0123456789lc-"
@@ -1354,7 +1263,6 @@ def scan_label_callouts(page_img: Image.Image, angles: list[float]) -> dict[str,
         rot = rotate_keep_size(page_img, a)
         W, H = rot.size
 
-        # downscale for speed
         scale = min(1.0, (MAX_DET_PIXELS / (W * H)) ** 0.5) if W * H > 0 else 1.0
         if scale < 1.0:
             small = rot.resize((max(1, int(W * scale)), max(1, int(H * scale))), Image.BICUBIC)
@@ -1383,7 +1291,6 @@ def scan_label_callouts(page_img: Image.Image, angles: list[float]) -> dict[str,
 
             x = int(data["left"][i]); y = int(data["top"][i])
             w = int(data["width"][i]); h = int(data["height"][i])
-            # bucket bboxes (20px grid in small-image space)
             bx = int(x / 20); by = int(y / 20)
             counts[lab].add((a, bx, by, int(w / 10), int(h / 10)))
 
@@ -1439,12 +1346,10 @@ def extract_pairs_from_pdf(
     print(f"→ {len(images)} page(s)")
 
     variants = [
-        # dot-preserving references
         {"name": "gray",   "thresh": "none", "inv": False, "scale": 1.0, "blur": 0, "denoise": False, "morph_close": False, "dot_ref": True,  "line_clean": False, "line_mask": True},
         {"name": "gray2x", "thresh": "none", "inv": False, "scale": 2.0, "blur": 0, "denoise": False, "morph_close": False, "dot_ref": True,  "line_clean": False, "line_mask": True},
         {"name": "otsu0",  "thresh": "otsu", "inv": False, "scale": 1.0, "blur": 0, "denoise": False, "morph_close": False, "dot_ref": True,  "line_clean": False, "line_mask": True},
 
-        # general OCR variants
         {"name": "ag0",    "thresh": "adaptive_gauss","inv": False, "scale": 1.0, "blur": 0, "denoise": False, "morph_close": False, "dot_ref": False, "line_clean": False, "line_mask": True},
         {"name": "ag_s1",  "thresh": "adaptive_gauss","inv": False, "scale": 1.0, "blur": 3, "denoise": False, "morph_close": False, "dot_ref": False, "line_clean": False, "line_mask": True},
         {"name": "ag_inv", "thresh": "adaptive_gauss","inv": True,  "scale": 1.0, "blur": 3, "denoise": True,  "morph_close": False, "dot_ref": False, "line_clean": False, "line_mask": True},
@@ -1463,8 +1368,9 @@ def extract_pairs_from_pdf(
              "dot_ref": False, "line_clean": True, "inpaint_radius": LINE_INPAINT_RADIUS, "line_mask": True},
         ]
 
-    # SHLEX-safe whitelist (no quotes). Include L/C for table IDs.
-    whitelist = "0123456789NSEWnsewLClc.,-°oº()'\""
+    # IMPORTANT: do NOT include quote characters in whitelist (shlex will explode).
+    # We reconstruct bearings without relying on minute/second quote glyphs.
+    whitelist = "0123456789NSEWnsewLClc.,-°oº()"
     common = f"-c preserve_interword_spaces=1 -c classify_bln_numeric_mode=1 -c tessedit_enable_dict_correction=0 -c tessedit_char_whitelist={whitelist}"
 
     ocr_configs = [
@@ -1475,7 +1381,6 @@ def extract_pairs_from_pdf(
         (f'--oem 1 --psm 11 {common}', "legacy_sparse"),
     ]
 
-    # Table OCR configs: emphasize block/table rows
     table_configs = [
         (f'--oem 3 --psm 6  {common}', "table_block"),
         (f'--oem 3 --psm 4  {common}', "table_columns"),
@@ -1488,13 +1393,11 @@ def extract_pairs_from_pdf(
     if debug_dir:
         debug_dir.mkdir(parents=True, exist_ok=True)
 
-    # Callout counts (page-level; merge across pages)
     global_callouts = defaultdict(int)
 
     for page_idx, page_img in enumerate(images, 1):
         print(f"  Page {page_idx}...")
 
-        # scan callouts for L#/C# (a few angles only)
         callouts = scan_label_callouts(page_img, callout_angles)
         for k, v in callouts.items():
             global_callouts[k] += v
@@ -1503,7 +1406,6 @@ def extract_pairs_from_pdf(
             rot_img = rotate_keep_size(page_img, angle)
             W, H = rot_img.size
 
-            # 1) bearing/distance callouts ROIs
             rois = detect_bearing_distance_rois(rot_img, roi_pad=roi_pad, max_rois=max_rois)
 
             tiled_mode = False
@@ -1554,7 +1456,6 @@ def extract_pairs_from_pdf(
                     cands = [c for c in cands if not c.get("_rejected_header_footer")]
                     all_candidates.extend(cands)
 
-            # 2) table ROIs (line/curve tables)
             if enable_tables:
                 table_rois = detect_table_rois(rot_img, max_tables=6)
                 if table_rois:
@@ -1563,12 +1464,10 @@ def extract_pairs_from_pdf(
                     tx1, ty1, tx2, ty2 = tr
                     tcrop = rot_img.crop((tx1, ty1, tx2, ty2))
 
-                    # require label in tables to avoid random numbers inside table block
                     require_label = True
                     cands = multipass_ocr_on_roi(tcrop, ocr_configs=table_configs, variants=variants, require_label=require_label)
 
                     for c in cands:
-                        # Keep only those whose ref_id matches table type expectations
                         rid = c.get("ref_id")
                         if not rid:
                             continue
@@ -1577,8 +1476,6 @@ def extract_pairs_from_pdf(
                         if tkind == "curve_table" and not rid.startswith("C"):
                             continue
 
-                        # For curve table: prefer chord bearing/distance, but OCR may see other bearings in row.
-                        # We keep all and let voting + hinting settle; add a small hint flag.
                         raw = (c.get("raw_line") or "")
                         c["curve_hint"] = bool(CURVE_HINT_RE.search(raw))
 
@@ -1593,9 +1490,6 @@ def extract_pairs_from_pdf(
 
         print(f"    Candidates so far: callouts={len(all_candidates)}  tables={len(table_candidates)}")
 
-    # ---------------------------
-    # Voting for callout-bearing candidates (non-table)
-    # ---------------------------
     if not all_candidates and not table_candidates:
         return [], dict(global_callouts)
 
@@ -1606,10 +1500,6 @@ def extract_pairs_from_pdf(
         w = [pick_cluster_winner(cl) for cl in clusters]
         winners.extend([x for x in w if x.get("support", 1) >= min_support])
 
-    # ---------------------------
-    # Voting for table candidates:
-    # group by (table_kind, ref_id) first, then vote within each group
-    # ---------------------------
     if table_candidates:
         groups = defaultdict(list)
         for c in table_candidates:
@@ -1619,14 +1509,11 @@ def extract_pairs_from_pdf(
             if not cands:
                 continue
 
-            # Within a label group, cluster by bearing/distance to suppress obvious OCR splits
             clusters = cluster_candidates(cands, dist_tol=dist_tol, bear_tol_deg=bear_tol_deg)
-            # choose cluster with max support, then best score
             cluster_winners = [pick_cluster_winner(cl) for cl in clusters]
             cluster_winners.sort(key=lambda x: (x.get("support", 1), x.get("vote_score", -1e9), x.get("best_conf", -1)), reverse=True)
             best = cluster_winners[0]
 
-            # Ensure the label survives and is correct
             best["ref_id"] = rid
             best["table_kind"] = tkind
             best["source"] = "voted_table"
@@ -1634,7 +1521,6 @@ def extract_pairs_from_pdf(
             if best.get("support", 1) >= min_support:
                 winners.append(best)
 
-    # Deduplicate exact (bearing+distance+ref_id+table_kind)
     best_map: dict[tuple[str, str, str | None, str | None], dict] = {}
     for w in winners:
         k = (w.get("bearing"), w.get("distance"), w.get("ref_id"), w.get("table_kind"))
@@ -1647,7 +1533,6 @@ def extract_pairs_from_pdf(
 
     out = list(best_map.values())
 
-    # attach callout counts to any label-bearing result
     for r in out:
         rid = r.get("ref_id")
         if rid:
@@ -1752,7 +1637,6 @@ def main():
     if not args.no_forced:
         pairs = apply_forced_pairs(pairs, FORCED_DEFAULT)
 
-    # Deduplicate again (bearing + measured distance + ref_id + table_kind)
     seen = set()
     uniq = []
     for p in pairs:
@@ -1806,7 +1690,6 @@ def main():
     print(f"\nTotal unique pairs: {len(pairs)}")
 
     if callouts:
-        # show a compact callout summary for labels that were found at least once
         top = sorted(callouts.items(), key=lambda kv: kv[0])
         shown = 0
         print("\nCallout counts (L#/C# occurrences detected):")
