@@ -1,0 +1,5 @@
+node_modules/
+queue.db
+queue.db-wal
+queue.db-shm
+uploads/
