@@ -1,104 +1,100 @@
-const Database = require("better-sqlite3");
+const fs = require("fs");
 const path = require("path");
 
-const DB_PATH = process.env.DB_PATH || path.join(__dirname, "..", "queue.db");
+const JOBS_DIR = process.env.JOBS_DIR || path.join(__dirname, "..", "jobs");
 
-let db;
+// Ensure jobs directory exists
+fs.mkdirSync(JOBS_DIR, { recursive: true });
 
-function getDb() {
-  if (!db) {
-    db = new Database(DB_PATH);
-    db.pragma("journal_mode = WAL");
-    db.pragma("busy_timeout = 5000");
-    db.exec(`
-      CREATE TABLE IF NOT EXISTS jobs (
-        id          TEXT PRIMARY KEY,
-        filename    TEXT NOT NULL,
-        filepath    TEXT NOT NULL,
-        status      TEXT NOT NULL DEFAULT 'pending',
-        quality     TEXT NOT NULL DEFAULT 'max',
-        created_at  TEXT NOT NULL,
-        started_at  TEXT,
-        finished_at TEXT,
-        error       TEXT,
-        result      TEXT,
-        progress    TEXT
-      );
-      CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
-      CREATE INDEX IF NOT EXISTS idx_jobs_created ON jobs(created_at);
-    `);
+function jobPath(id) {
+  return path.join(JOBS_DIR, `${id}.json`);
+}
+
+function readJob(id) {
+  const p = jobPath(id);
+  if (!fs.existsSync(p)) return null;
+  try {
+    return JSON.parse(fs.readFileSync(p, "utf8"));
+  } catch {
+    return null;
   }
-  return db;
+}
+
+function writeJob(job) {
+  const p = jobPath(job.id);
+  const tmp = p + ".tmp";
+  fs.writeFileSync(tmp, JSON.stringify(job, null, 2));
+  fs.renameSync(tmp, p);
 }
 
 function createJob({ id, filename, filepath, quality }) {
-  const db = getDb();
-  const now = new Date().toISOString();
-  db.prepare(`
-    INSERT INTO jobs (id, filename, filepath, status, quality, created_at)
-    VALUES (?, ?, ?, 'pending', ?, ?)
-  `).run(id, filename, filepath, quality, now);
-  return getJob(id);
+  const job = {
+    id,
+    filename,
+    filepath,
+    status: "pending",
+    quality,
+    created_at: new Date().toISOString(),
+    started_at: null,
+    finished_at: null,
+    error: null,
+    result: null,
+    progress: null,
+  };
+  writeJob(job);
+  return job;
 }
 
 function getJob(id) {
-  const db = getDb();
-  const row = db.prepare("SELECT * FROM jobs WHERE id = ?").get(id);
-  if (!row) return null;
-  return formatJob(row);
+  return readJob(id);
 }
 
 function listJobs({ status, limit = 100, offset = 0 } = {}) {
-  const db = getDb();
-  let sql = "SELECT * FROM jobs";
-  const params = [];
-  if (status) {
-    sql += " WHERE status = ?";
-    params.push(status);
+  let files;
+  try {
+    files = fs.readdirSync(JOBS_DIR).filter((f) => f.endsWith(".json") && !f.endsWith(".tmp"));
+  } catch {
+    return [];
   }
-  sql += " ORDER BY created_at DESC LIMIT ? OFFSET ?";
-  params.push(limit, offset);
-  const rows = db.prepare(sql).all(...params);
-  return rows.map(formatJob);
+
+  let jobs = [];
+  for (const f of files) {
+    try {
+      const job = JSON.parse(fs.readFileSync(path.join(JOBS_DIR, f), "utf8"));
+      if (!status || job.status === status) {
+        jobs.push(job);
+      }
+    } catch {
+      continue;
+    }
+  }
+
+  // Sort by created_at descending (newest first)
+  jobs.sort((a, b) => (b.created_at || "").localeCompare(a.created_at || ""));
+  return jobs.slice(offset, offset + limit);
 }
 
 function deleteJob(id) {
-  const db = getDb();
-  const job = db.prepare("SELECT * FROM jobs WHERE id = ?").get(id);
+  const job = readJob(id);
   if (!job) return null;
-  db.prepare("DELETE FROM jobs WHERE id = ?").run(id);
-  return formatJob(job);
+  const p = jobPath(id);
+  try {
+    fs.unlinkSync(p);
+  } catch {
+    // already gone
+  }
+  return job;
 }
 
 function getQueueStats() {
-  const db = getDb();
-  const rows = db.prepare("SELECT status, COUNT(*) as count FROM jobs GROUP BY status").all();
+  const jobs = listJobs({ limit: Infinity });
   const stats = { pending: 0, processing: 0, completed: 0, failed: 0 };
-  for (const row of rows) {
-    stats[row.status] = row.count;
+  for (const job of jobs) {
+    const s = job.status || "unknown";
+    if (s in stats) stats[s]++;
   }
   stats.total = Object.values(stats).reduce((a, b) => a + b, 0);
   return stats;
 }
 
-function formatJob(row) {
-  const job = { ...row };
-  // Parse result JSON if present
-  if (job.result) {
-    try {
-      job.result = JSON.parse(job.result);
-    } catch {
-      // leave as string if not valid JSON
-    }
-  }
-  return job;
-}
-
-function close() {
-  if (db) {
-    db.close();
-    db = null;
-  }
-}
-
-module.exports = { getDb, createJob, getJob, listJobs, deleteJob, getQueueStats, close };
+module.exports = { createJob, getJob, listJobs, deleteJob, getQueueStats };

@@ -3,7 +3,7 @@ const multer = require("multer");
 const { v4: uuidv4 } = require("uuid");
 const path = require("path");
 const fs = require("fs");
-const { createJob, getJob, listJobs, deleteJob, getQueueStats, close } = require("./db");
+const { createJob, getJob, listJobs, deleteJob, getQueueStats } = require("./db");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -165,11 +165,9 @@ const server = app.listen(PORT, () => {
 // Graceful shutdown
 process.on("SIGINT", () => {
   console.log("\n[server] Shutting down...");
-  close();
   server.close(() => process.exit(0));
 });
 process.on("SIGTERM", () => {
-  close();
   server.close(() => process.exit(0));
 });
 
