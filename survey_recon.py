@@ -1,33 +1,46 @@
 #!/usr/bin/env python3
 """
 survey_recon.py — General Record of Survey reconstruction CLI (evidence-first, plan-driven)
+v1.2.0-skeleton  (adds: subset selection + curves)
 
-WHAT THIS TOOL DOES (GENERAL, NOT SURVEY-SPECIFIC)
-- Extract/confirm record calls from plat text (OCR + user confirmation), with snippet evidence.
-- Detect drawn line segments in the plat image (OpenCV Hough) and associate callouts to segments.
-- Auto-order a set of record line calls into a traverse that minimizes misclosure (beam search),
-  then assign sequence numbers and generate a plan step.
+ADDED IN THIS VERSION
+1) SUBSET SELECTION ("autoloops"):
+   - Given many record line/curve calls, automatically proposes a *subset* that best closes
+     (min misclosure) AND looks like an outer boundary (max area/perimeter, low self-intersections).
+   - Then finds the best *ordering* of that subset (beam search) and can apply layer+seq.
+
+2) CURVES:
+   - Supports record curve calls (kind="curve") with radius + chord bearing + chord length + direction.
+   - Traverse builder supports curve segments, closure uses chord vector, perimeter uses arc length.
+   - DXF writer outputs LWPOLYLINE with bulges (works for left and right curves).
+   - SVG writer outputs true arcs (A commands) based on computed center/radius.
 
 DEFENSIBILITY RULES ENFORCED
-- No invented numbers: record values must come from OCR/user-confirmed text snippets.
-- Derived geometry is allowed only if explicitly marked computed with derivation notes.
-- Auto steps only PROPOSE order; the tool records the scoring + misclosure and you can reject/adjust.
-- Gates stop the run unless --force is used (which marks outputs "NON-DEFENSIBLE / REVIEW").
+- "record" values must come from OCR/user-confirmed snippets (or user entry during review).
+- "computed" segments must carry derivation notes.
+- Auto steps only PROPOSE; application (layer/seq) is explicit and logged.
+- Gates stop the run unless --force, which stamps diagnostics.
 
 WORKFLOW (typical)
   python survey_recon.py init plat.png --out out/myros
-  python survey_recon.py detect out/myros/project.json          # OCR candidate scan
-  python survey_recon.py review out/myros/project.json          # confirm calls + optionally compose line calls
-  python survey_recon.py lines-detect out/myros/project.json    # detect drawn segments
-  python survey_recon.py associate out/myros/project.json       # link calls to segments
-  python survey_recon.py autotrav out/myros/project.json --layer outer --set-seq --suggest-plan
+  python survey_recon.py detect out/myros/project.json
+  python survey_recon.py review out/myros/project.json     # includes line-compose + curve-compose
+  python survey_recon.py lines-detect out/myros/project.json
+  python survey_recon.py associate out/myros/project.json
+
+  # Propose outer loop subset + order:
+  python survey_recon.py autoloops out/myros/project.json --pool-layer any --min-sides 4 --max-sides 12 --top 5
+  python survey_recon.py autoloops out/myros/project.json --pool-layer any --apply 1 --set-layer outer --set-seq --suggest-plan
+
   python survey_recon.py plan-new out/myros/project.json --out-plan out/myros/plan.json
   python survey_recon.py solve out/myros/project.json --plan out/myros/plan.json
   python survey_recon.py render out/myros/project.json --svg --dxf
   python survey_recon.py report out/myros/project.json
 
-NOTE
-- This is NOT boundary determination. It reconstructs record geometry + proves closure layers.
+OPTIONAL DEPS
+  pip install pillow pytesseract
+  pip install opencv-python
+  pip install tabulate
 """
 
 from __future__ import annotations
@@ -48,7 +61,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 # -----------------------------
 # Precision / policy defaults
 # -----------------------------
-PROJECT_VERSION = "1.1.0-skeleton"
+PROJECT_VERSION = "1.2.0-skeleton"
 
 DIST_REPORT_DECIMALS = 2          # ft
 MISCLS_REPORT_DECIMALS = 3        # ft
@@ -150,6 +163,9 @@ class Vec:
 def cross(a: Vec, b: Vec) -> float:
     return a.de * b.dn - a.dn * b.de
 
+def dot(a: Vec, b: Vec) -> float:
+    return a.de * b.de + a.dn * b.dn
+
 def az_deg_from_vec(v: Vec) -> float:
     # azimuth clockwise from North: atan2(E, N)
     ang = math.degrees(math.atan2(v.de, v.dn))
@@ -192,6 +208,19 @@ def close_ring(points: List[Pt]) -> List[Pt]:
     if dist(points[0], points[-1]) > 1e-6:
         return points + [points[0]]
     return points
+
+def polygon_area(points: List[Pt]) -> float:
+    ring = close_ring(points)
+    a = 0.0
+    for i in range(len(ring) - 1):
+        x1, y1 = ring[i].e, ring[i].n
+        x2, y2 = ring[i + 1].e, ring[i + 1].n
+        a += x1 * y2 - x2 * y1
+    return 0.5 * a  # signed
+
+def polygon_perimeter(points: List[Pt]) -> float:
+    ring = close_ring(points)
+    return sum(dist(ring[i], ring[i + 1]) for i in range(len(ring) - 1))
 
 
 # -----------------------------
@@ -278,6 +307,15 @@ BEARING_RE = re.compile(
 
 DIST_RE = re.compile(r"(?P<val>\d+(?:\.\d+)?)")
 
+ANGLE_DMS_RE = re.compile(
+    r"""
+    (?P<deg>\d{1,3})\s*(?:°|º|d|deg)\s*
+    (?P<min>\d{1,2})\s*(?:'|m|min)\s*
+    (?P<sec>\d{1,2}(?:\.\d+)?)\s*(?:"|s|sec)
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
 def parse_quadrant_bearing(text: str) -> QuadrantBearing:
     t = text.strip().replace("º", "°")
     m = BEARING_RE.search(t)
@@ -299,6 +337,27 @@ def parse_distance_ft(text: str) -> float:
     if not m:
         raise ValueError(f"Could not parse distance: {text!r}")
     return float(m.group("val"))
+
+def parse_angle_deg(text: str) -> float:
+    """
+    Accepts:
+      - DMS like 10°20'30"
+      - or decimal like 10.345
+    """
+    t = text.strip().replace("º", "°")
+    m = ANGLE_DMS_RE.search(t)
+    if m:
+        deg = int(m.group("deg"))
+        minutes = int(m.group("min"))
+        seconds = float(m.group("sec"))
+        if not (0 <= minutes < 60) or not (0 <= seconds < 60):
+            raise ValueError(f"Angle minutes/seconds out of range: {minutes} {seconds}")
+        return deg + minutes / 60.0 + seconds / 3600.0
+    # decimal fallback
+    try:
+        return float(re.findall(r"[-+]?\d+(?:\.\d+)?", t)[0])
+    except Exception as e:
+        raise ValueError(f"Could not parse angle: {text!r}") from e
 
 
 # -----------------------------
@@ -330,6 +389,16 @@ class RecordCall:
     distance_text: Optional[str] = None
     bearing: Optional[QuadrantBearing] = None
     distance_ft: Optional[float] = None
+
+    # Curve fields (for kind="curve")
+    curve_dir: Optional[str] = None        # 'L' or 'R' (CCW or CW in model space)
+    curve_radius_ft: Optional[float] = None
+    curve_delta_deg: Optional[float] = None
+    curve_arc_len_ft: Optional[float] = None
+    curve_chord_bearing_text: Optional[str] = None
+    curve_chord_bearing: Optional[QuadrantBearing] = None
+    curve_chord_len_ft: Optional[float] = None
+
     tags: List[str] = field(default_factory=list)  # includes 'record' or 'computed'
     derivation: Optional[str] = None
     evidence: Evidence = field(default_factory=lambda: Evidence(type="ocr"))
@@ -347,7 +416,7 @@ class RecordCall:
 
 
 # -----------------------------
-# Image line segments + association
+# Image line segments + association (optional)
 # -----------------------------
 @dataclass
 class LineSegment:
@@ -357,14 +426,10 @@ class LineSegment:
     x2: int
     y2: int
     length_px: float
-    angle_deg: float  # 0..180 measured from +x axis for convenience
+    angle_deg: float  # 0..180 measured from +x axis
     source: str = "hough"
 
-def seg_mid(seg: LineSegment) -> Tuple[float, float]:
-    return ((seg.x1 + seg.x2) / 2.0, (seg.y1 + seg.y2) / 2.0)
-
 def point_to_segment_distance_px(px: float, py: float, seg: LineSegment) -> float:
-    # distance from point to line segment in pixel coords
     x1, y1, x2, y2 = seg.x1, seg.y1, seg.x2, seg.y2
     vx = x2 - x1
     vy = y2 - y1
@@ -381,6 +446,21 @@ def point_to_segment_distance_px(px: float, py: float, seg: LineSegment) -> floa
 
 
 # -----------------------------
+# Traverse primitives (for render)
+# -----------------------------
+@dataclass
+class Primitive:
+    type: str                # 'line' or 'arc'
+    start: Pt
+    end: Pt
+    bulge: float = 0.0       # for DXF LWPOLYLINE
+    radius_ft: Optional[float] = None
+    center: Optional[Pt] = None
+    dir: Optional[str] = None        # 'L'/'R'
+    delta_deg: Optional[float] = None
+
+
+# -----------------------------
 # Closures / Results
 # -----------------------------
 @dataclass
@@ -388,7 +468,6 @@ class Closure:
     sum_dn: float
     sum_de: float
     misclosure_ft: float
-    misclosure_bearing: QuadrantBearing
     total_length_ft: float
     closure_ratio: float
 
@@ -397,7 +476,9 @@ class LayerResult:
     id: str
     build_type: str
     calls_used: List[str]
-    points: List[Pt]
+    vertices: List[Pt]             # without duplicated start
+    closed: bool
+    primitives: List[Primitive]    # segment-by-segment
     closure: Closure
     gate_passed: bool
     gate_notes: str
@@ -436,20 +517,28 @@ class Project:
         def qb_to_dict(q: Optional[QuadrantBearing]) -> Any:
             if q is None:
                 return None
-            return {
-                "ns": q.ns, "ew": q.ew,
-                "deg": q.angle.deg, "min": q.angle.minutes, "sec": q.angle.seconds
-            }
+            return {"ns": q.ns, "ew": q.ew, "deg": q.angle.deg, "min": q.angle.minutes, "sec": q.angle.seconds}
 
         def pt_to_list(p: Pt) -> List[float]:
             return [p.e, p.n]
+
+        def primitive_to_dict(p: Primitive) -> Dict[str, Any]:
+            return {
+                "type": p.type,
+                "start": pt_to_list(p.start),
+                "end": pt_to_list(p.end),
+                "bulge": p.bulge,
+                "radius_ft": p.radius_ft,
+                "center": (None if p.center is None else pt_to_list(p.center)),
+                "dir": p.dir,
+                "delta_deg": p.delta_deg,
+            }
 
         def closure_to_dict(c: Closure) -> Dict[str, Any]:
             return {
                 "sum_dn": c.sum_dn,
                 "sum_de": c.sum_de,
                 "misclosure_ft": c.misclosure_ft,
-                "misclosure_bearing": qb_to_dict(c.misclosure_bearing),
                 "total_length_ft": c.total_length_ft,
                 "closure_ratio": c.closure_ratio,
             }
@@ -467,6 +556,7 @@ class Project:
                 k: {
                     **dataclasses.asdict(v),
                     "bearing": qb_to_dict(v.bearing),
+                    "curve_chord_bearing": qb_to_dict(v.curve_chord_bearing),
                 }
                 for k, v in self.calls.items()
             },
@@ -475,7 +565,9 @@ class Project:
                     "id": v.id,
                     "build_type": v.build_type,
                     "calls_used": v.calls_used,
-                    "points": [pt_to_list(p) for p in v.points],
+                    "vertices": [pt_to_list(p) for p in v.vertices],
+                    "closed": v.closed,
+                    "primitives": [primitive_to_dict(p) for p in v.primitives],
                     "closure": closure_to_dict(v.closure),
                     "gate_passed": v.gate_passed,
                     "gate_notes": v.gate_notes,
@@ -499,11 +591,10 @@ class Project:
         def dict_to_qb(d: Any) -> Optional[QuadrantBearing]:
             if d is None:
                 return None
-            return QuadrantBearing(
-                d["ns"],
-                DMS(int(d["deg"]), int(d["min"]), float(d["sec"])),
-                d["ew"],
-            )
+            return QuadrantBearing(d["ns"], DMS(int(d["deg"]), int(d["min"]), float(d["sec"])), d["ew"])
+
+        def list_to_pt(a: List[float]) -> Pt:
+            return Pt(float(a[0]), float(a[1]))
 
         proj = Project(
             version=obj["version"],
@@ -527,6 +618,15 @@ class Project:
                 distance_text=v.get("distance_text"),
                 bearing=dict_to_qb(v.get("bearing")),
                 distance_ft=v.get("distance_ft"),
+
+                curve_dir=v.get("curve_dir"),
+                curve_radius_ft=v.get("curve_radius_ft"),
+                curve_delta_deg=v.get("curve_delta_deg"),
+                curve_arc_len_ft=v.get("curve_arc_len_ft"),
+                curve_chord_bearing_text=v.get("curve_chord_bearing_text"),
+                curve_chord_bearing=dict_to_qb(v.get("curve_chord_bearing")),
+                curve_chord_len_ft=v.get("curve_chord_len_ft"),
+
                 tags=v.get("tags", []),
                 derivation=v.get("derivation"),
                 evidence=Evidence(**ev),
@@ -537,28 +637,35 @@ class Project:
             calls[k] = rc
         proj.calls = calls
 
-        def list_to_pt(a: List[float]) -> Pt:
-            return Pt(float(a[0]), float(a[1]))
-
-        def dict_to_closure(c: Dict[str, Any]) -> Closure:
-            mb = dict_to_qb(c["misclosure_bearing"]) or QuadrantBearing("N", DMS(0, 0, 0), "E")
-            return Closure(
-                sum_dn=float(c["sum_dn"]),
-                sum_de=float(c["sum_de"]),
-                misclosure_ft=float(c["misclosure_ft"]),
-                misclosure_bearing=mb,
-                total_length_ft=float(c["total_length_ft"]),
-                closure_ratio=float(c["closure_ratio"]),
-            )
-
         layers = {}
         for k, v in (obj.get("layers") or {}).items():
+            prims = []
+            for pd in (v.get("primitives") or []):
+                prims.append(Primitive(
+                    type=pd["type"],
+                    start=list_to_pt(pd["start"]),
+                    end=list_to_pt(pd["end"]),
+                    bulge=float(pd.get("bulge", 0.0)),
+                    radius_ft=pd.get("radius_ft"),
+                    center=(None if pd.get("center") is None else list_to_pt(pd["center"])),
+                    dir=pd.get("dir"),
+                    delta_deg=pd.get("delta_deg"),
+                ))
+            cld = v["closure"]
             layers[k] = LayerResult(
                 id=v["id"],
                 build_type=v["build_type"],
                 calls_used=list(v["calls_used"]),
-                points=[list_to_pt(p) for p in v["points"]],
-                closure=dict_to_closure(v["closure"]),
+                vertices=[list_to_pt(p) for p in v["vertices"]],
+                closed=bool(v.get("closed", False)),
+                primitives=prims,
+                closure=Closure(
+                    sum_dn=float(cld["sum_dn"]),
+                    sum_de=float(cld["sum_de"]),
+                    misclosure_ft=float(cld["misclosure_ft"]),
+                    total_length_ft=float(cld["total_length_ft"]),
+                    closure_ratio=float(cld["closure_ratio"]),
+                ),
                 gate_passed=bool(v["gate_passed"]),
                 gate_notes=str(v["gate_notes"]),
             )
@@ -566,12 +673,19 @@ class Project:
 
         lots = {}
         for k, v in (obj.get("lots") or {}).items():
+            cld = v["closure"]
             lots[k] = LotResult(
                 id=v["id"],
                 polygon=[list_to_pt(p) for p in v["polygon"]],
                 perimeter_ft=float(v["perimeter_ft"]),
                 area_sqft=float(v["area_sqft"]),
-                closure=dict_to_closure(v["closure"]),
+                closure=Closure(
+                    sum_dn=float(cld["sum_dn"]),
+                    sum_de=float(cld["sum_de"]),
+                    misclosure_ft=float(cld["misclosure_ft"]),
+                    total_length_ft=float(cld["total_length_ft"]),
+                    closure_ratio=float(cld["closure_ratio"]),
+                ),
             )
         proj.lots = lots
 
@@ -611,13 +725,6 @@ def crop_save_snip(image_path: Path, bbox: List[int], out_path: Path, pad: int =
     snip.save(out_path)
 
 def ocr_scan_candidates(image_path: Path) -> List[CallCandidate]:
-    """
-    Heuristic detection:
-    - pytesseract image_to_data gives words + bboxes
-    - group by approximate text lines
-    - detect bearing patterns or distance-ish patterns
-    Output must be confirmed in review.
-    """
     Image, pytesseract = try_import_ocr()
     if Image is None or pytesseract is None:
         raise RuntimeError("OCR deps missing. Install: pip install pillow pytesseract (and system tesseract).")
@@ -715,68 +822,208 @@ def detect_line_segments_hough(
     if lines is None:
         return segs
 
-    # LinesP returns shape (N,1,4)
     for L in lines:
         x1, y1, x2, y2 = [int(v) for v in L[0]]
         length = math.hypot(x2 - x1, y2 - y1)
         if length < min_len:
             continue
         ang = math.degrees(math.atan2((y2 - y1), (x2 - x1)))
-        ang = abs(ang)  # normalize to 0..180-ish
+        ang = abs(ang)
         if ang > 180:
             ang = 360 - ang
         sid = stable_id("seg", x1, y1, x2, y2)
         segs.append(LineSegment(id=sid, x1=x1, y1=y1, x2=x2, y2=y2, length_px=length, angle_deg=ang))
 
-    # Keep longest segments (helps reduce noise)
     segs.sort(key=lambda s: s.length_px, reverse=True)
     return segs[:max_segments]
 
 
 # -----------------------------
-# Traverse + closure math
+# Curve parsing helpers
 # -----------------------------
-def lat_dep_from_call(bearing: QuadrantBearing, distance_ft: float) -> Tuple[float, float]:
-    az = math.radians(bearing.to_azimuth_deg())
-    dn = distance_ft * math.cos(az)
-    de = distance_ft * math.sin(az)
-    return dn, de
+CURVE_R_RE = re.compile(r"(?:\bR\b|R=|RADIUS)\s*=?\s*(\d+(?:\.\d+)?)", re.IGNORECASE)
+CURVE_L_RE = re.compile(r"(?:\bL\b|LEN|ARC)\s*=?\s*(\d+(?:\.\d+)?)", re.IGNORECASE)
+CURVE_CH_RE = re.compile(r"(?:\bCH\b|CHD|CHORD)\s*=?\s*(\d+(?:\.\d+)?)", re.IGNORECASE)
+CURVE_DIR_RE = re.compile(r"\b(LT|LEFT|RT|RIGHT|L|R)\b", re.IGNORECASE)
 
-def compute_closure_from_line_calls(calls: List[RecordCall]) -> Closure:
+def parse_curve_text(raw: str) -> Dict[str, Any]:
+    """
+    Very tolerant curve parser. Intended for user-confirmed curve table lines.
+    Extracts: radius, arc length, chord length, chord bearing, delta, direction.
+    """
+    t = raw.strip().replace("º", "°")
+    out: Dict[str, Any] = {}
+
+    # direction
+    md = CURVE_DIR_RE.search(t)
+    if md:
+        d = md.group(1).upper()
+        if d in ("LT", "LEFT", "L"):
+            out["dir"] = "L"
+        elif d in ("RT", "RIGHT", "R"):
+            out["dir"] = "R"
+
+    mr = CURVE_R_RE.search(t)
+    if mr:
+        out["radius_ft"] = float(mr.group(1))
+
+    ml = CURVE_L_RE.search(t)
+    if ml:
+        out["arc_len_ft"] = float(ml.group(1))
+
+    mch = CURVE_CH_RE.search(t)
+    if mch:
+        out["chord_len_ft"] = float(mch.group(1))
+
+    # chord bearing: find a quadrant bearing anywhere
+    mb = BEARING_RE.search(t)
+    if mb:
+        out["chord_bearing_text"] = mb.group(0)
+        out["chord_bearing"] = parse_quadrant_bearing(mb.group(0))
+
+    # delta: look for Δ or DELTA with an angle pattern
+    mdel = re.search(r"(?:Δ|DELTA)\s*=?\s*([0-9°'\"\s\.]+)", t, re.IGNORECASE)
+    if mdel:
+        out["delta_deg"] = parse_angle_deg(mdel.group(1))
+
+    return out
+
+
+# -----------------------------
+# Traverse math (supports lines + curves)
+# -----------------------------
+def _curve_requirements(c: RecordCall) -> None:
+    if c.curve_dir not in ("L", "R"):
+        raise ValueError(f"Curve {c.id} missing curve_dir (L/R)")
+    if c.curve_radius_ft is None or c.curve_radius_ft <= 0:
+        raise ValueError(f"Curve {c.id} missing radius")
+    # chord bearing/len is the primary supported representation
+    if c.curve_chord_bearing is None or c.curve_chord_len_ft is None:
+        raise ValueError(f"Curve {c.id} requires chord bearing + chord length (for v1.2)")
+    if c.curve_chord_len_ft <= 0:
+        raise ValueError(f"Curve {c.id} chord length invalid")
+
+def _curve_delta_rad(c: RecordCall) -> float:
+    # derive delta from chord length + radius if missing
+    R = float(c.curve_radius_ft)
+    C = float(c.curve_chord_len_ft)
+    x = min(1.0, max(-1.0, C / (2.0 * R)))
+    theta = 2.0 * math.asin(x)  # radians, magnitude
+    if c.curve_delta_deg is None:
+        return theta
+    # trust record delta if provided, but sanity check
+    rec = math.radians(float(c.curve_delta_deg))
+    # if wildly inconsistent, keep record but caller should gate in practice
+    return rec
+
+def _curve_arc_len(c: RecordCall) -> float:
+    if c.curve_arc_len_ft is not None and c.curve_arc_len_ft > 0:
+        return float(c.curve_arc_len_ft)
+    R = float(c.curve_radius_ft)
+    theta = _curve_delta_rad(c)
+    return R * theta
+
+def _curve_endpoint_vec(c: RecordCall) -> Vec:
+    # chord bearing + chord length defines end point relative to start
+    az = c.curve_chord_bearing.to_azimuth_deg()
+    u = vec_from_az_deg(az).unit()
+    C = float(c.curve_chord_len_ft)
+    return u.scale(C)
+
+def _curve_center_from_chord(start: Pt, end: Pt, R: float, dir_lr: str) -> Pt:
+    v = end - start
+    C = v.mag()
+    if C < EPS:
+        raise ValueError("Curve chord is zero")
+    if R + 1e-9 < C / 2.0:
+        raise ValueError(f"Radius {R} too small for chord {C} (R < C/2)")
+
+    u = v.unit()
+    # left perpendicular (CCW rotation) in (E,N): (-dn, de)
+    left = Vec(-u.dn, u.de)
+    right = Vec(u.dn, -u.de)
+
+    h = math.sqrt(max(0.0, R * R - (C * 0.5) * (C * 0.5)))
+    mid = Pt((start.e + end.e) * 0.5, (start.n + end.n) * 0.5)
+    if dir_lr == "L":
+        return mid + left.scale(h)
+    return mid + right.scale(h)
+
+def _bulge_from_delta(delta_rad_signed: float) -> float:
+    return math.tan(delta_rad_signed / 4.0)
+
+def call_endpoint_and_primitive(cur: Pt, c: RecordCall) -> Tuple[Pt, float, Primitive]:
+    """
+    Returns:
+      next_point, length_for_total, primitive (line/arc)
+    For closure vector sums, we always use endpoint vector (next - cur).
+    For total length, lines use distance_ft, curves use arc length (or computed).
+    """
+    if c.kind == "line":
+        if c.bearing is None or c.distance_ft is None:
+            raise ValueError(f"Line {c.id} missing bearing/distance")
+        u = vec_from_az_deg(c.bearing.to_azimuth_deg()).unit()
+        L = float(c.distance_ft)
+        nxt = cur + u.scale(L)
+        prim = Primitive(type="line", start=cur, end=nxt, bulge=0.0)
+        return nxt, L, prim
+
+    if c.kind == "curve":
+        _curve_requirements(c)
+        dv = _curve_endpoint_vec(c)
+        nxt = cur + dv
+        R = float(c.curve_radius_ft)
+        theta = _curve_delta_rad(c)
+        # signed theta: L is +CCW, R is -CW
+        signed = theta if c.curve_dir == "L" else -theta
+        bulge = _bulge_from_delta(signed)
+        center = _curve_center_from_chord(cur, nxt, R, c.curve_dir)
+        prim = Primitive(
+            type="arc",
+            start=cur,
+            end=nxt,
+            bulge=bulge,
+            radius_ft=R,
+            center=center,
+            dir=c.curve_dir,
+            delta_deg=math.degrees(theta),
+        )
+        return nxt, _curve_arc_len(c), prim
+
+    raise ValueError(f"Unsupported call kind in traverse: {c.kind}")
+
+def closure_from_calls(calls: List[RecordCall]) -> Closure:
     sum_dn = 0.0
     sum_de = 0.0
     total_len = 0.0
+    cur = Pt(0.0, 0.0)
     for c in calls:
-        if c.bearing is None or c.distance_ft is None:
-            raise ValueError(f"Call {c.id} missing bearing/distance")
-        dn, de = lat_dep_from_call(c.bearing, float(c.distance_ft))
-        sum_dn += dn
-        sum_de += de
-        total_len += float(c.distance_ft)
+        nxt, seg_len, _ = call_endpoint_and_primitive(cur, c)
+        dv = nxt - cur
+        sum_de += dv.de
+        sum_dn += dv.dn
+        total_len += seg_len
+        cur = nxt
 
     mis = math.hypot(sum_dn, sum_de)
-    mis_b = QuadrantBearing.from_azimuth_deg(az_deg_from_vec(Vec(sum_de, sum_dn)))
     ratio = (total_len / mis) if mis > EPS else float("inf")
+    return Closure(sum_dn=sum_dn, sum_de=sum_de, misclosure_ft=mis, total_length_ft=total_len, closure_ratio=ratio)
 
-    return Closure(
-        sum_dn=sum_dn,
-        sum_de=sum_de,
-        misclosure_ft=mis,
-        misclosure_bearing=mis_b,
-        total_length_ft=total_len,
-        closure_ratio=ratio,
-    )
-
-def build_traverse(start: Pt, calls: List[RecordCall]) -> List[Pt]:
-    pts = [start]
+def build_traverse_vertices_and_prims(start: Pt, calls: List[RecordCall], close_tol: float = 0.10) -> Tuple[List[Pt], bool, List[Primitive]]:
+    verts: List[Pt] = [start]
+    prims: List[Primitive] = []
     cur = start
     for c in calls:
-        if c.bearing is None or c.distance_ft is None:
-            raise ValueError(f"Call {c.id} missing bearing/distance")
-        v = vec_from_az_deg(c.bearing.to_azimuth_deg()).unit().scale(float(c.distance_ft))
-        cur = cur + v
-        pts.append(cur)
-    return pts
+        nxt, _, prim = call_endpoint_and_primitive(cur, c)
+        prims.append(prim)
+        verts.append(nxt)
+        cur = nxt
+
+    # verts currently includes final endpoint
+    closed = dist(verts[0], verts[-1]) <= close_tol
+    if closed:
+        verts = verts[:-1]  # drop duplicate
+    return verts, closed, prims
 
 
 # -----------------------------
@@ -841,7 +1088,7 @@ class Plan:
 
 
 # -----------------------------
-# Plan Solver (generic step engine)
+# Plan Solver (supports traverse lines+curves)
 # -----------------------------
 class PlanSolver:
     def __init__(self, project: Project, audit: AuditLogger, force: bool = False):
@@ -873,16 +1120,14 @@ class PlanSolver:
             if cid not in self.project.calls:
                 raise SystemExit(f"{layer_id}: Missing call {cid}")
             c = self.project.calls[cid]
-            if c.kind != "line":
-                raise SystemExit(f"{layer_id}: Call {cid} must be kind='line'")
-            if c.bearing is None or c.distance_ft is None:
-                raise SystemExit(f"{layer_id}: Call {cid} missing bearing/distance")
+            if c.kind not in ("line", "curve"):
+                raise SystemExit(f"{layer_id}: Call {cid} must be kind='line' or 'curve'")
             if not (c.is_record() or c.is_computed()):
                 raise SystemExit(f"{layer_id}: Call {cid} must be tagged 'record' or 'computed'")
             calls.append(c)
 
-        pts = close_ring(build_traverse(start_pt, calls))
-        cl = compute_closure_from_line_calls(calls)
+        cl = closure_from_calls(calls)
+        verts, closed, prims = build_traverse_vertices_and_prims(start_pt, calls, close_tol=float(step.params.get("close_tol_ft", 0.10)))
 
         gate_pass = True
         notes = "OK"
@@ -901,7 +1146,9 @@ class PlanSolver:
             id=layer_id,
             build_type="traverse",
             calls_used=call_ids,
-            points=pts,
+            vertices=verts,
+            closed=closed,
+            primitives=prims,
             closure=cl,
             gate_passed=gate_pass,
             gate_notes=notes,
@@ -909,7 +1156,7 @@ class PlanSolver:
 
 
 # -----------------------------
-# Loop finding: beam search ordering by closure feasibility
+# Loop finding (ordering) + subset selection (outer loop proposals)
 # -----------------------------
 @dataclass
 class LoopSolveResult:
@@ -918,15 +1165,28 @@ class LoopSolveResult:
     closure_ratio: float
     sum_dn: float
     sum_de: float
+    total_len_ft: float
 
-def _call_vector(c: RecordCall) -> Tuple[float, float, float]:
+def _call_vector_and_len(c: RecordCall) -> Tuple[float, float, float]:
     """
-    Returns (dn, de, length).
+    Returns (dn, de, total_len_contrib).
+    For lines: dn,de from bearing/distance and total length=distance.
+    For curves: dn,de from chord and total length=arc length.
     """
-    if c.bearing is None or c.distance_ft is None:
-        raise ValueError(f"Call {c.id} missing bearing/distance")
-    dn, de = lat_dep_from_call(c.bearing, float(c.distance_ft))
-    return dn, de, float(c.distance_ft)
+    if c.kind == "line":
+        if c.bearing is None or c.distance_ft is None:
+            raise ValueError(f"Line {c.id} missing bearing/distance")
+        u = vec_from_az_deg(c.bearing.to_azimuth_deg()).unit()
+        L = float(c.distance_ft)
+        return (u.dn * L, u.de * L, L)
+
+    if c.kind == "curve":
+        _curve_requirements(c)
+        dv = _curve_endpoint_vec(c)
+        # dv = (de,dn)
+        return (dv.dn, dv.de, _curve_arc_len(c))
+
+    raise ValueError(f"Unsupported call kind: {c.kind}")
 
 def find_best_loop_order_beam(
     calls: List[RecordCall],
@@ -934,44 +1194,31 @@ def find_best_loop_order_beam(
 ) -> LoopSolveResult:
     """
     Beam search over permutations to minimize final misclosure.
-
-    Defensible framing:
-    - This is a numeric proposal engine. It does NOT change any bearings/distances.
-    - It only suggests an order that yields the smallest closure error.
+    Note: vector sum is order-invariant, but ordering impacts polygon self-intersection/area.
+    This routine optimizes misclosure only; caller may apply post-scoring.
     """
     n = len(calls)
     if n < 3:
         raise ValueError("Need at least 3 calls for a loop.")
-
-    vecs = [(_call_vector(c)) for c in calls]
-    ids = [c.id for c in calls]
-    lengths = [v[2] for v in vecs]
-    total_len = sum(lengths)
-
-    # Precompute remaining length sums quickly
-    # We'll use a mask-based remaining length sum with a cached list of lengths.
-    # For n > 60 you'd need a different representation; typical plats are far below that.
     if n > 60:
-        raise ValueError("Too many calls for bitmask beam search (n>60). Split into subsets.")
+        raise ValueError("Too many calls for bitmask ordering search (n>60).")
 
-    # State: (score_bound, sum_dn, sum_de, used_mask, order_list)
-    # Bound is optimistic lower bound on achievable misclosure:
-    #   lb = max(0, |sum_vec| - remaining_total_length)
-    init = (0.0, 0.0, 0.0, 0, [])
-    beam = [init]
+    vecs = [(_call_vector_and_len(c)) for c in calls]
+    ids = [c.id for c in calls]
+    total_len = sum(v[2] for v in vecs)
 
-    # Precompute length by index
-    len_by_i = lengths
+    # state: (lb, sum_dn, sum_de, used_mask, order)
+    beam = [(0.0, 0.0, 0.0, 0, [])]
 
-    for depth in range(n):
+    len_by_i = [v[2] for v in vecs]
+
+    for _depth in range(n):
         next_beam = []
-        for _, sdn, sde, mask, order in beam:
-            # remaining length total
+        for _lb, sdn, sde, mask, order in beam:
             rem_len = 0.0
             for i in range(n):
                 if not (mask >> i) & 1:
                     rem_len += len_by_i[i]
-
             for i in range(n):
                 if (mask >> i) & 1:
                     continue
@@ -981,46 +1228,218 @@ def find_best_loop_order_beam(
                 nmask = mask | (1 << i)
                 norder = order + [ids[i]]
 
-                # optimistic bound on final misclosure after adding this vector
-                # remaining after selecting i:
                 rem2 = rem_len - L
                 cur_mag = math.hypot(nsdn, nsde)
-                lb = max(0.0, cur_mag - rem2)
+                lb2 = max(0.0, cur_mag - rem2)
+                next_beam.append((lb2, nsdn, nsde, nmask, norder))
 
-                next_beam.append((lb, nsdn, nsde, nmask, norder))
-
-        # Keep best beam_width by lb, tie-break by shorter partial |sum|
         next_beam.sort(key=lambda t: (t[0], math.hypot(t[1], t[2])))
         beam = next_beam[:beam_width]
 
-    # Evaluate final states
     best = None
-    for _, sdn, sde, mask, order in beam:
+    for _lb, sdn, sde, mask, order in beam:
         if mask != (1 << n) - 1:
             continue
         mis = math.hypot(sdn, sde)
         ratio = (total_len / mis) if mis > EPS else float("inf")
-        cand = (mis, -ratio, sdn, sde, order)  # minimize mis
+        cand = (mis, -ratio, order, sdn, sde)
         if best is None or cand < best:
             best = cand
 
     if best is None:
-        raise RuntimeError("Beam search failed to produce a complete permutation.")
+        raise RuntimeError("Ordering beam search failed.")
+    mis, neg_ratio, order, sdn, sde = best
+    ratio = -neg_ratio
+    return LoopSolveResult(order, mis, ratio, sdn, sde, total_len)
 
-    mis, _, sdn, sde, order = best
-    ratio = (total_len / mis) if mis > EPS else float("inf")
+def traverse_points_for_order(calls_by_id: Dict[str, RecordCall], ordered_ids: List[str], start: Pt = Pt(0.0, 0.0)) -> List[Pt]:
+    pts = [start]
+    cur = start
+    for cid in ordered_ids:
+        c = calls_by_id[cid]
+        nxt, _, _ = call_endpoint_and_primitive(cur, c)
+        pts.append(nxt)
+        cur = nxt
+    return pts
 
-    return LoopSolveResult(
-        ordered_call_ids=order,
-        misclosure_ft=mis,
-        closure_ratio=ratio,
-        sum_dn=sdn,
-        sum_de=sde,
-    )
+def _seg_intersect_strict(a1: Pt, a2: Pt, b1: Pt, b2: Pt) -> bool:
+    """
+    Proper intersection test excluding shared endpoints.
+    """
+    def orient(p: Pt, q: Pt, r: Pt) -> float:
+        return (q.e - p.e) * (r.n - p.n) - (q.n - p.n) * (r.e - p.e)
+
+    def on_segment(p: Pt, q: Pt, r: Pt) -> bool:
+        return (min(p.e, r.e) - 1e-12 <= q.e <= max(p.e, r.e) + 1e-12 and
+                min(p.n, r.n) - 1e-12 <= q.n <= max(p.n, r.n) + 1e-12)
+
+    o1 = orient(a1, a2, b1)
+    o2 = orient(a1, a2, b2)
+    o3 = orient(b1, b2, a1)
+    o4 = orient(b1, b2, a2)
+
+    # general
+    if (o1 * o2 < 0) and (o3 * o4 < 0):
+        return True
+
+    # collinear special cases
+    if abs(o1) < 1e-12 and on_segment(a1, b1, a2): return True
+    if abs(o2) < 1e-12 and on_segment(a1, b2, a2): return True
+    if abs(o3) < 1e-12 and on_segment(b1, a1, b2): return True
+    if abs(o4) < 1e-12 and on_segment(b1, a2, b2): return True
+
+    return False
+
+def count_self_intersections(polyline_pts: List[Pt]) -> int:
+    """
+    Counts segment intersections for a closed ring polyline (using successive points).
+    Excludes adjacent edges.
+    """
+    pts = polyline_pts
+    if len(pts) < 4:
+        return 0
+    # close ring if not closed
+    if dist(pts[0], pts[-1]) > 1e-6:
+        pts = pts + [pts[0]]
+    m = len(pts) - 1
+    edges = [(pts[i], pts[i+1]) for i in range(m)]
+    cnt = 0
+    for i in range(m):
+        for j in range(i+1, m):
+            # skip adjacent and shared endpoints
+            if abs(i - j) <= 1:
+                continue
+            if i == 0 and j == m - 1:
+                continue
+            a1, a2 = edges[i]
+            b1, b2 = edges[j]
+            if _seg_intersect_strict(a1, a2, b1, b2):
+                cnt += 1
+    return cnt
+
+@dataclass
+class LoopProposal:
+    subset_ids: List[str]
+    ordered_ids: List[str]
+    misclosure_ft: float
+    ratio: float
+    perimeter_ft: float
+    area_sqft: float
+    intersections: int
+
+def select_best_subsets_beam(
+    calls: List[RecordCall],
+    k: int,
+    beam_width: int = 800,
+    top_n: int = 20,
+) -> List[Tuple[List[int], float, float]]:
+    """
+    Beam search in subset space (combinations) minimizing |sum vector|.
+    Returns list of (indices, misclosure, perimeter).
+    """
+    n = len(calls)
+    vecs = [(_call_vector_and_len(c)) for c in calls]
+
+    # states: (score, last_index, sum_dn, sum_de, perim, picked_indices)
+    # score uses |sum|, tie-break -perim (prefer longer)
+    beam = [(0.0, -1, 0.0, 0.0, 0.0, [])]
+
+    for depth in range(k):
+        next_beam = []
+        for _score, last_i, sdn, sde, perim, picked in beam:
+            for i in range(last_i + 1, n):
+                dn, de, L = vecs[i]
+                nsdn = sdn + dn
+                nsde = sde + de
+                nper = perim + L
+                np = picked + [i]
+                mag = math.hypot(nsdn, nsde)
+                next_beam.append((mag, i, nsdn, nsde, nper, np))
+
+        # prune
+        next_beam.sort(key=lambda t: (t[0], -t[4]))
+        beam = next_beam[:beam_width]
+
+    finals = []
+    for mag, last_i, sdn, sde, perim, idxs in beam:
+        finals.append((idxs, mag, perim))
+    finals.sort(key=lambda t: (t[1], -t[2]))
+    return finals[:top_n]
+
+def propose_loops_from_pool(
+    calls_by_id: Dict[str, RecordCall],
+    pool_ids: List[str],
+    min_sides: int,
+    max_sides: int,
+    top: int,
+    beam_subset: int,
+    beam_order: int,
+) -> List[LoopProposal]:
+    # Build call list
+    pool_calls = [calls_by_id[cid] for cid in pool_ids]
+    # Pre-filter: ensure vectors exist
+    filtered: List[RecordCall] = []
+    for c in pool_calls:
+        if c.kind not in ("line", "curve"):
+            continue
+        if not c.is_record():
+            continue
+        try:
+            _call_vector_and_len(c)
+        except Exception:
+            continue
+        filtered.append(c)
+
+    # Hard cap to keep subset beam tractable (favor longer perimeter contributions)
+    filtered.sort(key=lambda c: _call_vector_and_len(c)[2], reverse=True)
+    # default cap if not supplied via flags: 40
+    filtered = filtered[: min(len(filtered), 40)]
+    if len(filtered) < min_sides:
+        raise ValueError(f"Not enough usable calls in pool after filtering (have {len(filtered)}).")
+
+    proposals: List[LoopProposal] = []
+
+    for k in range(min_sides, max_sides + 1):
+        subset_candidates = select_best_subsets_beam(filtered, k=k, beam_width=beam_subset, top_n=max(10, top * 4))
+        for idxs, mis, perim in subset_candidates:
+            subset = [filtered[i] for i in idxs]
+            # order for area/intersection scoring
+            order_res = find_best_loop_order_beam(subset, beam_width=beam_order)
+            pts = traverse_points_for_order(calls_by_id, order_res.ordered_call_ids, start=Pt(0.0, 0.0))
+            # If misclosure is large, area is meaningless; still report but will rank low.
+            area = abs(polygon_area(pts))
+            inter = count_self_intersections(pts)
+            proposals.append(LoopProposal(
+                subset_ids=[c.id for c in subset],
+                ordered_ids=order_res.ordered_call_ids,
+                misclosure_ft=order_res.misclosure_ft,
+                ratio=order_res.closure_ratio,
+                perimeter_ft=order_res.total_len_ft,
+                area_sqft=area,
+                intersections=inter,
+            ))
+
+    # Rank: prioritize (low misclosure), then (few intersections), then (max area), then (max perimeter), then (ratio)
+    def score(p: LoopProposal) -> Tuple[float, int, float, float, float]:
+        return (p.misclosure_ft, p.intersections, -p.area_sqft, -p.perimeter_ft, -p.ratio)
+
+    proposals.sort(key=score)
+    # keep unique by subset signature to avoid duplicates
+    seen = set()
+    uniq: List[LoopProposal] = []
+    for p in proposals:
+        sig = tuple(sorted(p.subset_ids))
+        if sig in seen:
+            continue
+        seen.add(sig)
+        uniq.append(p)
+        if len(uniq) >= top:
+            break
+    return uniq
 
 
 # -----------------------------
-# Rendering (SVG + minimal DXF)
+# Rendering (SVG with arcs, DXF LWPOLYLINE with bulges)
 # -----------------------------
 def escape_xml(s: str) -> str:
     return (s.replace("&", "&amp;")
@@ -1029,63 +1448,35 @@ def escape_xml(s: str) -> str:
               .replace('"', "&quot;")
               .replace("'", "&apos;"))
 
-def centroid(poly: List[Pt]) -> Tuple[float, float]:
-    ring = close_ring(poly)
-    A = 0.0
-    Cx = 0.0
-    Cy = 0.0
-    for i in range(len(ring) - 1):
-        x1, y1 = ring[i].e, ring[i].n
-        x2, y2 = ring[i + 1].e, ring[i + 1].n
-        cr = x1 * y2 - x2 * y1
-        A += cr
-        Cx += (x1 + x2) * cr
-        Cy += (y1 + y2) * cr
-    if abs(A) < EPS:
-        xs = [p.e for p in poly]
-        ys = [p.n for p in poly]
-        return (sum(xs) / len(xs), sum(ys) / len(ys))
-    A *= 0.5
-    Cx /= (6.0 * A)
-    Cy /= (6.0 * A)
-    return (Cx, Cy)
-
-def render_svg(project: Project, out_path: Path) -> None:
-    all_pts: List[Pt] = []
+def _svg_viewbox_from_layers(project: Project) -> Tuple[float,float,float,float]:
+    pts: List[Pt] = []
     for lr in project.layers.values():
-        all_pts.extend(lr.points)
+        pts.extend(lr.vertices)
     for lot in project.lots.values():
-        all_pts.extend(lot.polygon)
-    if not all_pts:
-        raise RuntimeError("No geometry to render (run solve first).")
-
-    min_e = min(p.e for p in all_pts)
-    max_e = max(p.e for p in all_pts)
-    min_n = min(p.n for p in all_pts)
-    max_n = max(p.n for p in all_pts)
-
-    width = max_e - min_e
-    height = max_n - min_n
-    pad = max(width, height) * 0.05 + 10.0
-
+        pts.extend(lot.polygon)
+    if not pts:
+        raise RuntimeError("No geometry to render.")
+    min_e = min(p.e for p in pts)
+    max_e = max(p.e for p in pts)
+    min_n = min(p.n for p in pts)
+    max_n = max(p.n for p in pts)
+    w = max_e - min_e
+    h = max_n - min_n
+    pad = max(w, h) * 0.05 + 10.0
     vb_min_e = min_e - pad
     vb_min_n = min_n - pad
-    vb_w = width + 2 * pad
-    vb_h = height + 2 * pad
+    vb_w = w + 2 * pad
+    vb_h = h + 2 * pad
+    return vb_min_e, vb_min_n, vb_w, vb_h
+
+def render_svg(project: Project, out_path: Path) -> None:
+    vb_min_e, vb_min_n, vb_w, vb_h = _svg_viewbox_from_layers(project)
 
     def svg_xy(p: Pt) -> Tuple[float, float]:
         x = p.e
+        # invert y
         y = (vb_min_n + vb_h) - p.n
         return x, y
-
-    def poly_path(points: List[Pt]) -> str:
-        pts = close_ring(points)
-        parts = []
-        for i, p in enumerate(pts):
-            x, y = svg_xy(p)
-            parts.append(("M" if i == 0 else "L") + f" {x:.3f} {y:.3f}")
-        parts.append("Z")
-        return " ".join(parts)
 
     svg = []
     svg.append('<?xml version="1.0" encoding="UTF-8"?>')
@@ -1096,38 +1487,89 @@ def render_svg(project: Project, out_path: Path) -> None:
     svg.append('.label{fill:#e9eef6;font-family:Arial, sans-serif;font-size:6px;}')
     svg.append('</style>')
 
+    # draw traverse layers using primitives
     for lid, lr in project.layers.items():
-        if not lr.points:
+        if not lr.primitives:
             continue
-        svg.append(f'<path class="layer" d="{poly_path(lr.points)}"/>')
-        cx, cy = centroid(lr.points)
-        x, y = svg_xy(Pt(cx, cy))
-        svg.append(f'<text class="label" x="{x:.3f}" y="{y:.3f}">{escape_xml(lid)}</text>')
+        dparts = []
+        # move to start
+        x0, y0 = svg_xy(lr.primitives[0].start)
+        dparts.append(f"M {x0:.3f} {y0:.3f}")
+        for prim in lr.primitives:
+            if prim.type == "line":
+                x, y = svg_xy(prim.end)
+                dparts.append(f"L {x:.3f} {y:.3f}")
+            elif prim.type == "arc":
+                if prim.radius_ft is None or prim.dir is None or prim.delta_deg is None:
+                    # fallback to straight
+                    x, y = svg_xy(prim.end)
+                    dparts.append(f"L {x:.3f} {y:.3f}")
+                else:
+                    # SVG flags: coordinate y inverted, so sweep flips.
+                    # Model 'L' (CCW) becomes clockwise in SVG => sweep=1; 'R' => sweep=0
+                    sweep = 1 if prim.dir == "L" else 0
+                    large_arc = 1 if float(prim.delta_deg) > 180.0 else 0
+                    r = float(prim.radius_ft)
+                    x, y = svg_xy(prim.end)
+                    dparts.append(f"A {r:.3f} {r:.3f} 0 {large_arc} {sweep} {x:.3f} {y:.3f}")
+            else:
+                x, y = svg_xy(prim.end)
+                dparts.append(f"L {x:.3f} {y:.3f}")
 
+        if lr.closed:
+            dparts.append("Z")
+
+        svg.append(f'<path class="layer" d="{" ".join(dparts)}"/>')
+        # label near centroid of vertices (rough)
+        vx = [p.e for p in lr.vertices]
+        vy = [p.n for p in lr.vertices]
+        cx = sum(vx) / len(vx)
+        cy = sum(vy) / len(vy)
+        lx, ly = svg_xy(Pt(cx, cy))
+        svg.append(f'<text class="label" x="{lx:.3f}" y="{ly:.3f}">{escape_xml(lid)}</text>')
+
+    # lots (polyline)
     for lot in project.lots.values():
-        svg.append(f'<path class="lot" d="{poly_path(lot.polygon)}"/>')
-        cx, cy = centroid(lot.polygon)
-        x, y = svg_xy(Pt(cx, cy))
-        svg.append(f'<text class="label" x="{x:.3f}" y="{y:.3f}">{escape_xml(lot.id)}</text>')
+        pts = close_ring(lot.polygon)
+        dparts = []
+        for i, p in enumerate(pts):
+            x, y = svg_xy(p)
+            dparts.append(("M" if i == 0 else "L") + f" {x:.3f} {y:.3f}")
+        dparts.append("Z")
+        svg.append(f'<path class="lot" d="{" ".join(dparts)}"/>')
 
     svg.append("</svg>")
     write_text(out_path, "\n".join(svg))
 
 def render_dxf_minimal(project: Project, out_path: Path) -> None:
-    entities: List[str] = []
+    """
+    Outputs:
+      - LWPOLYLINE per traverse layer, with bulges for arcs (supports L/R)
+      - LWPOLYLINE for lots as straight segments
+    """
+    ents: List[str] = []
 
-    def add_line(a: Pt, b: Pt, layer: str):
-        entities.extend([
-            "0", "LINE",
+    def add_lwpolyline(vertices: List[Pt], bulges: List[float], closed: bool, layer: str):
+        # LWPOLYLINE
+        n = len(vertices)
+        if n < 2:
+            return
+        if len(bulges) != n:
+            raise ValueError("bulges length must equal vertices length")
+        ents.extend([
+            "0", "LWPOLYLINE",
             "8", layer,
-            "10", f"{a.e:.6f}",
-            "20", f"{a.n:.6f}",
-            "11", f"{b.e:.6f}",
-            "21", f"{b.n:.6f}",
+            "90", str(n),
+            "70", "1" if closed else "0",
         ])
+        for i, p in enumerate(vertices):
+            ents.extend(["10", f"{p.e:.6f}", "20", f"{p.n:.6f}"])
+            b = float(bulges[i])
+            if abs(b) > 1e-12:
+                ents.extend(["42", f"{b:.12f}"])
 
     def add_text(p: Pt, text: str, height: float, layer: str):
-        entities.extend([
+        ents.extend([
             "0", "TEXT",
             "8", layer,
             "10", f"{p.e:.6f}",
@@ -1136,16 +1578,35 @@ def render_dxf_minimal(project: Project, out_path: Path) -> None:
             "1", text,
         ])
 
+    # layers
     for lid, lr in project.layers.items():
-        pts = close_ring(lr.points)
-        for i in range(len(pts) - 1):
-            add_line(pts[i], pts[i + 1], lid.upper())
+        if not lr.primitives:
+            continue
+        # vertices are stored without duplicate start
+        verts = lr.vertices
+        if len(verts) < 2:
+            continue
+        # bulges aligned with vertices: bulge at vertex i for segment from i to i+1 (wrap if closed)
+        bulges = [0.0] * len(verts)
+        # primitives length should equal number of segments; if closed, segments == len(verts)
+        for i, prim in enumerate(lr.primitives):
+            if i >= len(verts):
+                break
+            bulges[i] = float(prim.bulge) if prim.type == "arc" else 0.0
+        add_lwpolyline(verts, bulges, lr.closed, lid.upper())
+        # label
+        cx = sum(p.e for p in verts) / len(verts)
+        cy = sum(p.n for p in verts) / len(verts)
+        add_text(Pt(cx, cy), lid, height=1.5, layer="LAYER_LABELS")
 
+    # lots (straight, no bulges)
     for lot in project.lots.values():
-        pts = close_ring(lot.polygon)
-        for i in range(len(pts) - 1):
-            add_line(pts[i], pts[i + 1], "LOTS")
-        cx, cy = centroid(lot.polygon)
+        poly = close_ring(lot.polygon)
+        verts = poly[:-1]
+        bulges = [0.0] * len(verts)
+        add_lwpolyline(verts, bulges, True, "LOTS")
+        cx = sum(p.e for p in verts) / len(verts)
+        cy = sum(p.n for p in verts) / len(verts)
         add_text(Pt(cx, cy), lot.id, height=1.5, layer="LOT_LABELS")
 
     dxf = []
@@ -1153,7 +1614,7 @@ def render_dxf_minimal(project: Project, out_path: Path) -> None:
     dxf.extend(["9", "$ACADVER", "1", "AC1015"])  # AutoCAD 2000
     dxf.extend(["0", "ENDSEC"])
     dxf.extend(["0", "SECTION", "2", "ENTITIES"])
-    dxf.extend(entities)
+    dxf.extend(ents)
     dxf.extend(["0", "ENDSEC", "0", "EOF"])
     write_text(out_path, "\n".join(dxf))
 
@@ -1190,41 +1651,35 @@ def report_markdown(project: Project) -> str:
 
     lines.append("## A) EXTRACTED RECORD CALLS")
     lines.append("")
-    rows = [["id", "kind", "layer", "seq", "bearing", "distance_ft", "tags", "evidence", "seg", "seg_dist_px"]]
+    rows = [["id","kind","layer","seq","bearing/chord","dist/chord","R","Δ","arc","dir","tags","evidence","seg","seg_dist_px"]]
     for cid, c in sorted(project.calls.items(), key=lambda kv: kv[0]):
-        b = c.bearing.format() if c.bearing else (c.bearing_text or "")
-        d = fmt_ft(float(c.distance_ft)) if c.distance_ft is not None else (c.distance_text or "")
-        rows.append([
-            cid, c.kind, c.layer, str(c.seq) if c.seq is not None else "",
-            b, d, ",".join(c.tags), c.evidence.type,
-            c.assoc_segment_id or "", f"{c.assoc_segment_dist_px:.1f}" if c.assoc_segment_dist_px is not None else ""
-        ])
+        if c.kind == "line":
+            b = c.bearing.format() if c.bearing else (c.bearing_text or "")
+            d = fmt_ft(float(c.distance_ft)) if c.distance_ft is not None else (c.distance_text or "")
+            rows.append([cid,c.kind,c.layer,str(c.seq or ""),b,d,"","","","",",".join(c.tags),c.evidence.type,c.assoc_segment_id or "", f"{c.assoc_segment_dist_px:.1f}" if c.assoc_segment_dist_px is not None else ""])
+        elif c.kind == "curve":
+            cb = c.curve_chord_bearing.format() if c.curve_chord_bearing else (c.curve_chord_bearing_text or "")
+            ch = fmt_ft(float(c.curve_chord_len_ft)) if c.curve_chord_len_ft is not None else ""
+            rows.append([cid,c.kind,c.layer,str(c.seq or ""),cb,ch,
+                         fmt_ft(float(c.curve_radius_ft)) if c.curve_radius_ft is not None else "",
+                         f"{float(c.curve_delta_deg):.4f}" if c.curve_delta_deg is not None else "",
+                         fmt_ft(float(c.curve_arc_len_ft)) if c.curve_arc_len_ft is not None else "",
+                         c.curve_dir or "",
+                         ",".join(c.tags),c.evidence.type,c.assoc_segment_id or "", f"{c.assoc_segment_dist_px:.1f}" if c.assoc_segment_dist_px is not None else ""])
+        else:
+            rows.append([cid,c.kind,c.layer,str(c.seq or ""),c.bearing_text or "",c.distance_text or "","","","","",",".join(c.tags),c.evidence.type,c.assoc_segment_id or "", f"{c.assoc_segment_dist_px:.1f}" if c.assoc_segment_dist_px is not None else ""])
     lines.append(render_table(rows))
     lines.append("")
 
-    lines.append("## B) DETECTED LINE SEGMENTS (IMAGE SPACE)")
+    lines.append("## B) LAYER CLOSURES")
     lines.append("")
-    rows = [["id", "len_px", "angle_deg", "x1", "y1", "x2", "y2"]]
-    for s in project.segments[:80]:
-        rows.append([s.id, f"{s.length_px:.1f}", f"{s.angle_deg:.1f}", str(s.x1), str(s.y1), str(s.x2), str(s.y2)])
-    if len(project.segments) > 80:
-        rows.append(["…", f"(+{len(project.segments)-80} more)", "", "", "", "", ""])
-    lines.append(render_table(rows))
-    lines.append("")
-
-    lines.append("## C) LAYER CLOSURES")
-    lines.append("")
-    rows = [["layer", "build", "ΣΔN (ft)", "ΣΔE (ft)", "miscl (ft)", "miscl (in)", "miscl bearing", "total (ft)", "ratio", "gate"]]
+    rows = [["layer","build","ΣΔN (ft)","ΣΔE (ft)","miscl (ft)","miscl (in)","total (ft)","ratio","gate"]]
     for lid, lr in project.layers.items():
         cl = lr.closure
         rows.append([
-            lid,
-            lr.build_type,
-            fmt_ft_mis(cl.sum_dn),
-            fmt_ft_mis(cl.sum_de),
-            fmt_ft_mis(cl.misclosure_ft),
-            fmt_ft_mis(ft_to_inches(cl.misclosure_ft)),
-            cl.misclosure_bearing.format(),
+            lid, lr.build_type,
+            fmt_ft_mis(cl.sum_dn), fmt_ft_mis(cl.sum_de),
+            fmt_ft_mis(cl.misclosure_ft), fmt_ft_mis(ft_to_inches(cl.misclosure_ft)),
             fmt_ft(cl.total_length_ft),
             "∞" if not math.isfinite(cl.closure_ratio) else f"1:{cl.closure_ratio:.0f}",
             "PASS" if lr.gate_passed else "FAIL",
@@ -1244,7 +1699,7 @@ def report_markdown(project: Project) -> str:
 
 
 # -----------------------------
-# Interactive review utilities
+# Interactive prompts
 # -----------------------------
 def prompt_yes_no(msg: str, default: bool = True) -> bool:
     suffix = " [Y/n]: " if default else " [y/N]: "
@@ -1270,6 +1725,15 @@ def prompt_int(msg: str, default: Optional[int] = None) -> Optional[int]:
     except Exception:
         return default
 
+def prompt_float(msg: str, default: Optional[float] = None) -> Optional[float]:
+    v = input(f"{msg}{' ['+str(default)+']' if default is not None else ''}: ").strip()
+    if not v:
+        return default
+    try:
+        return float(v)
+    except Exception:
+        return default
+
 def prompt_choice(msg: str, choices: List[str], default: Optional[str] = None) -> str:
     ch = ", ".join(choices)
     while True:
@@ -1285,16 +1749,9 @@ def prompt_choice(msg: str, choices: List[str], default: Optional[str] = None) -
 # Plan generation helper
 # -----------------------------
 def generate_plan_from_classified_traverses(project: Project) -> Plan:
-    """
-    Generates a starter plan.json based on calls that have:
-      - kind='line'
-      - layer != 'unassigned'
-      - seq set
-    Creates one traverse step per layer.
-    """
     layer_map: Dict[str, List[RecordCall]] = {}
     for c in project.calls.values():
-        if c.kind != "line":
+        if c.kind not in ("line", "curve"):
             continue
         if c.layer == "unassigned":
             continue
@@ -1306,13 +1763,15 @@ def generate_plan_from_classified_traverses(project: Project) -> Plan:
     for layer_id, calls in sorted(layer_map.items(), key=lambda kv: kv[0]):
         ordered = sorted(calls, key=lambda c: c.seq if c.seq is not None else 0)
         call_ids = [c.id for c in ordered]
-        gates = [{"type": "closure",
-                  "max_mis_ft": project.flags.get("default_max_mis_ft", 0.05),
-                  "min_ratio": project.flags.get("default_min_ratio", 50000)}]
+        gates = [{
+            "type": "closure",
+            "max_mis_ft": project.flags.get("default_max_mis_ft", 0.05),
+            "min_ratio": project.flags.get("default_min_ratio", 50000),
+        }]
         steps.append(PlanStep(
             id=f"traverse_{layer_id}",
             type="traverse",
-            params={"layer_id": layer_id, "start": {"e": 0.0, "n": 0.0}, "call_ids": call_ids},
+            params={"layer_id": layer_id, "start": {"e": 0.0, "n": 0.0}, "call_ids": call_ids, "close_tol_ft": project.flags.get("close_tol_ft", 0.10)},
             gates=gates,
         ))
 
@@ -1342,6 +1801,7 @@ def cmd_init(args: argparse.Namespace) -> None:
     proj.flags.setdefault("default_min_ratio", 50000)
     proj.flags.setdefault("plan_id", "plan")
     proj.flags.setdefault("force", False)
+    proj.flags.setdefault("close_tol_ft", 0.10)
 
     proj_path = out_dir / "project.json"
     proj.save(proj_path)
@@ -1351,8 +1811,7 @@ def cmd_init(args: argparse.Namespace) -> None:
 def cmd_detect(args: argparse.Namespace) -> None:
     proj_path = Path(args.project).resolve()
     proj = Project.load(proj_path)
-    out_dir = Path(proj.out_dir)
-    audit = AuditLogger(out_dir / "audit.ndjson")
+    audit = AuditLogger(Path(proj.out_dir) / "audit.ndjson")
 
     cands = ocr_scan_candidates(Path(proj.image_path))
     existing = {c.id for c in proj.candidates}
@@ -1370,7 +1829,8 @@ def cmd_review(args: argparse.Namespace) -> None:
     """
     Interactive evidence confirmation:
     - Accept OCR candidates into record calls with snippet evidence
-    - Optionally compose bearing+distance into line calls
+    - Compose LINE calls from bearing+distance
+    - Compose CURVE calls from curve table text or manual entry
     """
     proj_path = Path(args.project).resolve()
     proj = Project.load(proj_path)
@@ -1379,6 +1839,7 @@ def cmd_review(args: argparse.Namespace) -> None:
     snips_dir = ensure_dir(out_dir / "snips")
     img_path = Path(proj.image_path)
 
+    # Candidate review
     for cand in sorted(proj.candidates, key=lambda c: (-c.confidence, c.id)):
         print("\n------------------------------------------------------------")
         print(f"Candidate: {cand.id}  guess={cand.kind_guess}  conf~{cand.confidence:.1f}")
@@ -1433,6 +1894,7 @@ def cmd_review(args: argparse.Namespace) -> None:
         proj.calls[call_id] = rc
         audit.log("review_accept", {"cand": cand.id, "call_id": call_id, "kind": kind, "layer": rc.layer, "seq": rc.seq})
 
+    # Compose line calls
     while prompt_yes_no("Create a LINE call from existing bearing+distance calls?", default=False):
         line_id = prompt_str("Line call id", default=f"line_{stable_id(now_iso())}")
         layer = prompt_str("Layer for this line", default="unassigned")
@@ -1468,6 +1930,74 @@ def cmd_review(args: argparse.Namespace) -> None:
         audit.log("line_compose", {"line_id": line_id, "from_bearing": b_id, "from_distance": d_id, "layer": layer, "seq": seq})
         print(f"Created line call {line_id}")
 
+    # Compose curve calls
+    while prompt_yes_no("Create a CURVE call (record curve table entry)?", default=False):
+        curve_id = prompt_str("Curve call id", default=f"curve_{stable_id(now_iso())}")
+        layer = prompt_str("Layer for this curve", default="unassigned")
+        seq = prompt_int("Sequence number in traverse (optional)", default=None)
+
+        mode = prompt_choice("Curve input mode", ["paste", "manual"], default="paste")
+        rc = RecordCall(
+            id=curve_id,
+            kind="curve",
+            layer=layer,
+            seq=seq,
+            tags=["record"],
+            evidence=Evidence(type="user_confirmed", notes="curve entry"),
+        )
+
+        if mode == "paste":
+            raw = prompt_str("Paste curve table text line (R/Δ/L/CH/CB, LT/RT etc.)")
+            parsed = parse_curve_text(raw)
+            # if missing, ask
+            rc.curve_dir = parsed.get("dir") or prompt_choice("Direction", ["L", "R"], default="L")
+            rc.curve_radius_ft = parsed.get("radius_ft") or prompt_float("Radius (ft)")  # type: ignore
+            cb = parsed.get("chord_bearing")
+            if cb is None:
+                cbtxt = prompt_str("Chord bearing (quadrant DMS, e.g., N 12°34'56\" E)")
+                rc.curve_chord_bearing_text = cbtxt
+                rc.curve_chord_bearing = parse_quadrant_bearing(cbtxt)
+            else:
+                rc.curve_chord_bearing = cb
+                rc.curve_chord_bearing_text = parsed.get("chord_bearing_text")
+
+            rc.curve_chord_len_ft = parsed.get("chord_len_ft") or prompt_float("Chord length (ft)")  # type: ignore
+            if "delta_deg" in parsed:
+                rc.curve_delta_deg = float(parsed["delta_deg"])
+            if "arc_len_ft" in parsed:
+                rc.curve_arc_len_ft = float(parsed["arc_len_ft"])
+
+        else:
+            rc.curve_dir = prompt_choice("Direction", ["L", "R"], default="L")
+            rc.curve_radius_ft = prompt_float("Radius (ft)")  # type: ignore
+            cbtxt = prompt_str("Chord bearing (quadrant DMS)")
+            rc.curve_chord_bearing_text = cbtxt
+            rc.curve_chord_bearing = parse_quadrant_bearing(cbtxt)
+            rc.curve_chord_len_ft = prompt_float("Chord length (ft)")  # type: ignore
+            delta_txt = prompt_str("Delta (DMS or decimal) (optional)", default="")
+            if delta_txt:
+                rc.curve_delta_deg = parse_angle_deg(delta_txt)
+            arc_txt = prompt_str("Arc length (ft) (optional)", default="")
+            if arc_txt:
+                rc.curve_arc_len_ft = float(arc_txt)
+
+        # compute missing delta/arc if possible (still marked record, but derived from record fields)
+        try:
+            _curve_requirements(rc)
+            if rc.curve_delta_deg is None:
+                rc.curve_delta_deg = math.degrees(_curve_delta_rad(rc))
+            if rc.curve_arc_len_ft is None:
+                rc.curve_arc_len_ft = _curve_arc_len(rc)
+        except Exception as e:
+            print(f"[FAIL] Curve incomplete: {e}")
+            continue
+
+        proj.calls[curve_id] = rc
+        audit.log("curve_compose", {"curve_id": curve_id, "layer": layer, "seq": seq,
+                                   "dir": rc.curve_dir, "R": rc.curve_radius_ft, "delta": rc.curve_delta_deg,
+                                   "arc": rc.curve_arc_len_ft, "cb": rc.curve_chord_bearing_text, "ch": rc.curve_chord_len_ft})
+        print(f"Created curve call {curve_id}")
+
     proj.save(proj_path)
     print(f"Updated project: {proj_path}")
 
@@ -1495,10 +2025,6 @@ def cmd_lines_detect(args: argparse.Namespace) -> None:
     print(f"Detected {len(segs)} line segments and stored in project.")
 
 def cmd_associate(args: argparse.Namespace) -> None:
-    """
-    Associates each record call having an evidence bbox to the nearest detected line segment.
-    This is a PROPOSAL linkage: it helps you group calls by the edge they belong to.
-    """
     proj_path = Path(args.project).resolve()
     proj = Project.load(proj_path)
     out_dir = Path(proj.out_dir)
@@ -1535,73 +2061,82 @@ def cmd_associate(args: argparse.Namespace) -> None:
     audit.log("associate", {"updated": updated, "max_dist_px": args.max_dist_px})
     print(f"Associated {updated} calls to nearest segments.")
 
-def cmd_autotrav(args: argparse.Namespace) -> None:
+def cmd_autoloops(args: argparse.Namespace) -> None:
     """
-    Auto-order line calls into a closure-minimizing loop (beam search).
-    - Select calls by --layer, or explicit --call-ids
-    - Writes seq numbers if --set-seq
-    - Optionally suggests a traverse plan step in project.flags if --suggest-plan
+    Subset selection + ordering:
+      - Select pool of calls (record line/curve)
+      - Propose top-N loop subsets + orders
+      - Optionally apply one: set layer + seq, and suggest a plan step.
     """
     proj_path = Path(args.project).resolve()
     proj = Project.load(proj_path)
     out_dir = Path(proj.out_dir)
     audit = AuditLogger(out_dir / "audit.ndjson")
 
-    call_ids: List[str] = []
-    if args.call_ids:
-        call_ids = [s.strip() for s in args.call_ids.split(",") if s.strip()]
-    else:
-        # all line calls in layer
-        for cid, c in proj.calls.items():
-            if c.kind == "line" and c.layer == args.layer:
-                call_ids.append(cid)
-
-    if not call_ids:
-        raise SystemExit("No calls selected for autotrav (check --layer or --call-ids).")
-
-    calls = []
-    for cid in call_ids:
-        if cid not in proj.calls:
-            raise SystemExit(f"Missing call id: {cid}")
-        c = proj.calls[cid]
-        if c.kind != "line":
-            raise SystemExit(f"{cid} is not kind='line'")
-        if c.bearing is None or c.distance_ft is None:
-            raise SystemExit(f"{cid} missing bearing/distance")
+    # pool ids
+    pool_layer = args.pool_layer
+    pool_ids: List[str] = []
+    for cid, c in proj.calls.items():
+        if c.kind not in ("line", "curve"):
+            continue
         if not c.is_record():
-            raise SystemExit(f"{cid} must be tagged 'record' (auto-order does not accept untagged calls)")
-        calls.append(c)
+            continue
+        if pool_layer != "any" and c.layer != pool_layer:
+            continue
+        if args.require_assoc and not c.assoc_segment_id:
+            continue
+        pool_ids.append(cid)
 
-    res = find_best_loop_order_beam(calls, beam_width=args.beam)
-    audit.log("autotrav_result", {"layer": args.layer, "beam": args.beam, "result": dataclasses.asdict(res)})
+    if not pool_ids:
+        raise SystemExit("No calls in pool (check --pool-layer and tagging).")
 
-    print("\n=== Auto Traverse Proposal ===")
-    print(f"Calls: {len(calls)}")
-    print(f"Misclosure: {res.misclosure_ft:.4f} ft ({ft_to_inches(res.misclosure_ft):.2f} in)")
-    if math.isfinite(res.closure_ratio):
-        print(f"Closure ratio: 1:{res.closure_ratio:.0f}")
-    else:
-        print("Closure ratio: ∞")
-    print("Order:")
-    for i, cid in enumerate(res.ordered_call_ids, start=1):
-        print(f"  {i:02d}. {cid}")
+    props = propose_loops_from_pool(
+        proj.calls,
+        pool_ids=pool_ids,
+        min_sides=args.min_sides,
+        max_sides=args.max_sides,
+        top=args.top,
+        beam_subset=args.beam_subset,
+        beam_order=args.beam_order,
+    )
+
+    audit.log("autoloops_propose", {"pool_layer": pool_layer, "count_pool": len(pool_ids), "proposals": [dataclasses.asdict(p) for p in props]})
+
+    print("\n=== Loop Proposals (subset selection + ordering) ===")
+    for i, p in enumerate(props, start=1):
+        print(f"\n[{i}] sides={len(p.subset_ids)} mis={p.misclosure_ft:.4f} ft ({ft_to_inches(p.misclosure_ft):.2f} in) "
+              f"ratio={'∞' if not math.isfinite(p.ratio) else f'1:{p.ratio:.0f}'} "
+              f"perim={p.perimeter_ft:.2f} ft area={p.area_sqft:.1f} sqft inter={p.intersections}")
+        print("  ordered:")
+        for j, cid in enumerate(p.ordered_ids, start=1):
+            print(f"    {j:02d}. {cid}")
+
+    if args.apply is None:
+        return
+
+    k = int(args.apply)
+    if k < 1 or k > len(props):
+        raise SystemExit("--apply index out of range")
+    chosen = props[k - 1]
+
+    set_layer = args.set_layer
+    if set_layer:
+        for cid in chosen.ordered_ids:
+            proj.calls[cid].layer = set_layer
 
     if args.set_seq:
-        for i, cid in enumerate(res.ordered_call_ids, start=1):
+        for i, cid in enumerate(chosen.ordered_ids, start=1):
             proj.calls[cid].seq = i
-        proj.save(proj_path)
-        audit.log("autotrav_set_seq", {"count": len(res.ordered_call_ids), "layer": args.layer})
-        print(f"\nWrote seq=1..{len(res.ordered_call_ids)} into calls (layer={args.layer}).")
 
-    # Suggest a plan step (does not overwrite plan.json; it writes a proposal in project.flags)
     if args.suggest_plan:
         step = {
-            "id": f"traverse_{args.layer}",
+            "id": f"traverse_{set_layer or 'loop'}",
             "type": "traverse",
             "params": {
-                "layer_id": args.layer,
+                "layer_id": set_layer or "loop",
                 "start": {"e": args.start_e, "n": args.start_n},
-                "call_ids": res.ordered_call_ids,
+                "call_ids": chosen.ordered_ids,
+                "close_tol_ft": proj.flags.get("close_tol_ft", 0.10),
             },
             "gates": [{
                 "type": "closure",
@@ -1611,9 +2146,10 @@ def cmd_autotrav(args: argparse.Namespace) -> None:
         }
         proj.flags.setdefault("plan_step_proposals", [])
         proj.flags["plan_step_proposals"].append(step)
-        proj.save(proj_path)
-        audit.log("autotrav_suggest_plan", {"step": step})
-        print("\nStored plan step proposal in project.flags['plan_step_proposals'].")
+
+    proj.save(proj_path)
+    audit.log("autoloops_apply", {"apply": k, "set_layer": set_layer, "set_seq": args.set_seq, "suggest_plan": args.suggest_plan})
+    print("\nApplied selected proposal to project (layer/seq updated; plan step stored if requested).")
 
 def cmd_plan_new(args: argparse.Namespace) -> None:
     proj_path = Path(args.project).resolve()
@@ -1622,8 +2158,6 @@ def cmd_plan_new(args: argparse.Namespace) -> None:
     audit = AuditLogger(out_dir / "audit.ndjson")
 
     plan = generate_plan_from_classified_traverses(proj)
-
-    # If proposals exist, append them (in order added)
     proposals = proj.flags.get("plan_step_proposals", [])
     for p in proposals:
         plan.steps.append(PlanStep(id=p["id"], type=p["type"], params=p.get("params", {}), gates=p.get("gates", [])))
@@ -1682,7 +2216,7 @@ def cmd_report(args: argparse.Namespace) -> None:
 # CLI plumbing
 # -----------------------------
 def build_cli() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="survey-recon", description="General survey record reconstruction CLI (evidence-first).")
+    p = argparse.ArgumentParser(prog="survey-recon", description="General survey record reconstruction CLI (subset selection + curves).")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     s = sub.add_parser("init", help="Initialize a project.")
@@ -1694,7 +2228,7 @@ def build_cli() -> argparse.ArgumentParser:
     s.add_argument("project", help="Project JSON path.")
     s.set_defaults(func=cmd_detect)
 
-    s = sub.add_parser("review", help="Interactive review of candidates into confirmed record calls.")
+    s = sub.add_parser("review", help="Interactive review of candidates into confirmed record calls (includes line/curve compose).")
     s.add_argument("project", help="Project JSON path.")
     s.set_defaults(func=cmd_review)
 
@@ -1713,18 +2247,24 @@ def build_cli() -> argparse.ArgumentParser:
     s.add_argument("--max-dist-px", type=float, default=None, help="Ignore associations beyond this pixel distance.")
     s.set_defaults(func=cmd_associate)
 
-    s = sub.add_parser("autotrav", help="Auto-order selected line calls into a loop (beam search) and optionally set seq.")
+    s = sub.add_parser("autoloops", help="Subset selection + ordering to propose outer loop(s). Optionally apply layer/seq and suggest plan step.")
     s.add_argument("project", help="Project JSON path.")
-    s.add_argument("--layer", default="outer", help="Layer to select calls from if --call-ids not provided.")
-    s.add_argument("--call-ids", default="", help="Comma-separated call ids to order (overrides --layer).")
-    s.add_argument("--beam", type=int, default=800, help="Beam width (higher = more robust, more CPU).")
-    s.add_argument("--set-seq", action="store_true", help="Write seq numbers into calls per proposed order.")
-    s.add_argument("--suggest-plan", action="store_true", help="Store a traverse plan step proposal in project.flags.")
+    s.add_argument("--pool-layer", default="any", help="Select calls from this layer (or 'any').")
+    s.add_argument("--require-assoc", action="store_true", help="Only use calls that are associated to a detected segment.")
+    s.add_argument("--min-sides", type=int, default=4)
+    s.add_argument("--max-sides", type=int, default=12)
+    s.add_argument("--top", type=int, default=5)
+    s.add_argument("--beam-subset", type=int, default=800)
+    s.add_argument("--beam-order", type=int, default=800)
+    s.add_argument("--apply", type=int, default=None, help="Apply proposal index (1..top) to project.")
+    s.add_argument("--set-layer", default="", help="When applying, set calls' layer to this.")
+    s.add_argument("--set-seq", action="store_true", help="When applying, write seq numbers 1..N per proposed order.")
+    s.add_argument("--suggest-plan", action="store_true", help="When applying, store traverse step proposal in project.flags.")
     s.add_argument("--start-e", type=float, default=0.0)
     s.add_argument("--start-n", type=float, default=0.0)
-    s.set_defaults(func=cmd_autotrav)
+    s.set_defaults(func=cmd_autoloops)
 
-    s = sub.add_parser("plan-new", help="Generate plan.json from calls (layer + seq). Also appends plan_step_proposals if present.")
+    s = sub.add_parser("plan-new", help="Generate plan.json from calls (layer + seq). Appends plan_step_proposals if present.")
     s.add_argument("project", help="Project JSON path.")
     s.add_argument("--out-plan", default="", help="Output plan path (default: <out_dir>/plan.json)")
     s.set_defaults(func=cmd_plan_new)
