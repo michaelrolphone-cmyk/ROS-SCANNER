@@ -21,8 +21,13 @@ import datetime as dt
 import hashlib
 import json
 import math
+import os
+import platform
 import re
+import shutil
+import subprocess
 import sys
+import tempfile
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -338,6 +343,8 @@ OCR_CONFIG_CALLS = (
     "-c tessedit_char_whitelist=0123456789NSEWnsew°'.-"
 )
 OCR_CONFIG_FALLBACK = "--psm 6 -c preserve_interword_spaces=1"
+MINERU_TEXT_EXTENSIONS = (".md", ".txt")
+MINERU_JSON_EXTENSIONS = (".json",)
 
 def try_import_pillow():
     try:
@@ -388,7 +395,105 @@ def try_import_ocr():
     except Exception:
         return None, None
 
+def detect_default_ocr_engine() -> str:
+    system = platform.system().lower()
+    machine = platform.machine().lower()
+    if system == "darwin" and machine in {"arm64", "aarch64"}:
+        return "mineru"
+    return "tesseract"
+
+def resolve_ocr_engine() -> str:
+    val = (os.environ.get("SURVEY_RECON_OCR_ENGINE", "") or "").strip().lower()
+    if val in {"tesseract", "mineru"}:
+        return val
+    return detect_default_ocr_engine()
+
+def _mineru_command_candidates(image_path: Path, out_dir: Path) -> List[List[str]]:
+    return [
+        ["mineru", "-i", str(image_path), "-o", str(out_dir)],
+        ["mineru", "--input", str(image_path), "--output", str(out_dir)],
+        [sys.executable, "-m", "mineru", "-i", str(image_path), "-o", str(out_dir)],
+    ]
+
+def _mineru_extract_lines(out_dir: Path) -> List[str]:
+    lines: List[str] = []
+    for path in sorted(out_dir.rglob("*")):
+        if not path.is_file():
+            continue
+        if path.suffix.lower() in MINERU_TEXT_EXTENSIONS:
+            for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+                s = line.strip()
+                if s:
+                    lines.append(s)
+            continue
+        if path.suffix.lower() in MINERU_JSON_EXTENSIONS:
+            try:
+                obj = json.loads(path.read_text(encoding="utf-8", errors="ignore"))
+            except Exception:
+                continue
+            stack = [obj]
+            while stack:
+                cur = stack.pop()
+                if isinstance(cur, str):
+                    s = cur.strip()
+                    if s:
+                        lines.append(s)
+                elif isinstance(cur, dict):
+                    stack.extend(cur.values())
+                elif isinstance(cur, list):
+                    stack.extend(cur)
+    return lines
+
+def _mineru_image_to_lines(image_path: Path) -> List[str]:
+    if shutil.which("mineru") is None:
+        try:
+            import mineru  # noqa: F401 # type: ignore
+        except Exception as exc:
+            raise RuntimeError(f"mineru_not_installed: {exc}")
+
+    with tempfile.TemporaryDirectory(prefix="survey-recon-mineru-") as tmp:
+        out_dir = Path(tmp) / "out"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        last_err = "mineru invocation failed"
+        for cmd in _mineru_command_candidates(image_path, out_dir):
+            try:
+                proc = subprocess.run(cmd, check=True, capture_output=True, text=True)
+                if proc.stderr.strip():
+                    last_err = proc.stderr.strip()
+                break
+            except Exception as exc:
+                last_err = str(exc)
+        else:
+            raise RuntimeError(f"mineru_failed: {last_err}")
+
+        lines = _mineru_extract_lines(out_dir)
+        if not lines:
+            raise RuntimeError("mineru_no_text_output")
+        return lines
+
+def ocr_image_to_string(img, image_path: Optional[Path], config: str = OCR_CONFIG_CALLS) -> str:
+    engine = resolve_ocr_engine()
+    if engine == "mineru":
+        if image_path is None:
+            raise RuntimeError("mineru_requires_image_path")
+        return "\n".join(_mineru_image_to_lines(Path(image_path)))
+
+    Image, pytesseract = try_import_ocr()
+    if Image is None or pytesseract is None:
+        raise RuntimeError("OCR deps missing.")
+    return _tess_image_to_string_safe(pytesseract, img, config)
+
 def check_ocr_ready() -> Tuple[bool, str]:
+    engine = resolve_ocr_engine()
+    if engine == "mineru":
+        if shutil.which("mineru") is not None:
+            return True, "ok:mineru"
+        try:
+            import mineru  # noqa: F401 # type: ignore
+            return True, "ok:mineru"
+        except Exception as e:
+            return False, f"mineru_missing: {e}"
+
     Image, pytesseract = try_import_ocr()
     if Image is None or pytesseract is None:
         return False, "pytesseract_or_pillow_missing"
@@ -422,7 +527,23 @@ def _tess_image_to_string_safe(pytesseract, img, config: str) -> str:
             return pytesseract.image_to_string(img, config=OCR_CONFIG_FALLBACK)
         raise
 
-def ocr_scan_lines(img, config: str = OCR_CONFIG_CALLS) -> List[CallCandidate]:
+def ocr_scan_lines(img, config: str = OCR_CONFIG_CALLS, image_path: Optional[Path] = None) -> List[CallCandidate]:
+    engine = resolve_ocr_engine()
+    if engine == "mineru":
+        if image_path is None:
+            raise RuntimeError("mineru_requires_image_path")
+        lines = _mineru_image_to_lines(Path(image_path))
+        w, h = img.size
+        return [
+            CallCandidate(
+                id=stable_id("cand", text, idx),
+                text=text,
+                bbox=[0, min(h - 1, idx * 20), max(1, w), min(20, h)],
+                confidence=95.0,
+            )
+            for idx, text in enumerate(lines)
+        ]
+
     Image, pytesseract = try_import_ocr()
     if Image is None or pytesseract is None:
         raise RuntimeError("OCR deps missing.")
@@ -800,7 +921,7 @@ def aoi_propose_linework(project: Project, audit: AuditLogger, page: int,
             probe = open_pillow_image(Path(project.image_path), page=page).convert("RGB").crop((rx, ry, rx + rw, ry + rh))
             probe_pre = preprocess_pil(probe, mode="binary", threshold=170, scale=2.0)
             try:
-                s = _tess_image_to_string_safe(pytesseract, probe_pre, OCR_CONFIG_CALLS)
+                s = ocr_image_to_string(probe_pre, image_path=None, config=OCR_CONFIG_CALLS)
                 score += quick_bearing_likeness(s)
             except Exception as e:
                 audit.log("aoi_probe_ocr_fail", {"err": str(e)})
@@ -855,7 +976,7 @@ def aoi_run_tokens(project: Project, aoi_id: str, force: bool = False) -> Dict[s
         return payload
 
     img = open_pillow_image(Path(meta["paths"]["preprocess_image"]))
-    cands = ocr_scan_lines(img, config=OCR_CONFIG_CALLS)
+    cands = ocr_scan_lines(img, config=OCR_CONFIG_CALLS, image_path=Path(meta["paths"]["preprocess_image"]))
 
     scale = float(meta.get("preprocess", {}).get("scale", 1.0) or 1.0)
     bx, by, _, _ = [int(v) for v in meta["bbox_px"]]
@@ -1393,6 +1514,8 @@ def build_cli() -> argparse.ArgumentParser:
 
     s.add_argument("--pool-layer", default="pool")
     s.add_argument("--preview-max-calls", type=int, default=20)
+    s.add_argument("--ocr-engine", choices=["tesseract", "mineru"], default=None,
+                   help="Override OCR engine selection. Default is auto (MinerU on Apple Silicon, Tesseract otherwise).")
 
     s.set_defaults(func=cmd_run)
     return p
@@ -1400,6 +1523,8 @@ def build_cli() -> argparse.ArgumentParser:
 def main(argv: Optional[List[str]] = None) -> None:
     argv = argv if argv is not None else sys.argv[1:]
     args = build_cli().parse_args(argv)
+    if getattr(args, "ocr_engine", None):
+        os.environ["SURVEY_RECON_OCR_ENGINE"] = str(args.ocr_engine)
     args.func(args)
 
 if __name__ == "__main__":
